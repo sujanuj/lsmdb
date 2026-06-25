@@ -8,10 +8,7 @@ layer work, rather than depend on one.
 
 ## Status
 
-**Phase 1 (current): Write-ahead log + crash recovery**
-
-Every other piece of an LSM-tree — the memtable, SSTables, compaction — depends on
-durability being correct first, so that's where this starts.
+**Phase 1: Write-ahead log + crash recovery — done**
 
 - [x] WAL record format with per-record checksums (CRC32)
 - [x] Append-only writer with a configurable fsync policy
@@ -23,16 +20,55 @@ durability being correct first, so that's where this starts.
       byte the file is cut off at
 - [x] A live kill-9 demo (`cmd/lsmdb-cli`) for actually watching recovery happen
 
+**Phase 2 (current): Memtable**
+
+- [x] Skip list with a from-scratch xorshift64* PRNG for level promotion
+- [x] Put / Get / Delete (tombstone, not physical removal) / sorted iteration
+- [x] Concurrent-safe via RWMutex; verified race-free under concurrent
+      readers + a writer with `go test -race`
+- [x] Size-byte tracking on the Memtable wrapper, for a future flush threshold
+- [x] Cross-checked against a reference `map[string]string` over 20,000 random
+      put/delete operations
+- [x] Integration test proving `wal.Replay` correctly rebuilds a memtable —
+      including overwrites and tombstones surviving the replay exactly
+
 **Planned:**
 
-- [ ] Memtable (skip list, sorted, in-memory)
 - [ ] SSTable file format + flush from memtable
 - [ ] Bloom filters per SSTable
 - [ ] Multi-level reads (memtable -> newest SSTable -> older SSTables)
 - [ ] Compaction (size-tiered, to start)
-- [ ] Concurrent reader/writer isolation
 - [ ] Range scans (k-way merge iterator)
 - [ ] Benchmark suite vs. SQLite and BoltDB
+
+## Why a skip list, not a balanced tree, for the memtable
+
+A skip list insert only rewires a small, local set of pointers near the
+insertion point at each level. A balanced tree insert can trigger rotations
+that cascade upward toward the root and touch nodes far from where the new
+key landed. That locality is what makes skip lists much easier to reason
+about under concurrent access — it's the actual reason LevelDB, RocksDB, and
+most production LSM engines use a skip list for the memtable, not a
+simplification made for this project.
+
+Level promotion uses a hand-rolled xorshift64* generator (`internal/memtable/rand.go`)
+rather than `math/rand` — the level-promotion coin flip doesn't need
+cryptographic randomness, just speed and reasonable uniformity, which is
+exactly the use case xorshift generators are built for (it's the same
+generator family Go's own runtime uses internally for map iteration order).
+Each new node gets level 1 for free, then a 25% chance of promotion to each
+subsequent level (RocksDB's actual default `p = 0.25`), capped at 16 levels.
+
+## Why deletes are tombstones, not removals
+
+A delete has to be able to outrank an older `Put` for the same key even when
+that older `Put` already lives in a different, already-flushed SSTable. If
+`Delete` just removed the node from the memtable, a `Get` that fell through to
+an older SSTable would resurrect a value that was supposed to be gone.
+Writing a tombstone — itself a real entry that gets flushed and eventually
+removed during compaction once it's provably shadowed every older version of
+the key — is the standard LSM technique for making deletes correct across the
+whole multi-level structure.
 
 ## Why a WAL first
 
@@ -98,7 +134,8 @@ truncated tail.
 ## Running tests
 
 ```bash
-go test ./...
+go test ./...          # everything
+go test ./... -race    # with the race detector — important for internal/memtable
 ```
 
 ## Project layout
@@ -106,10 +143,10 @@ go test ./...
 ```
 lsmdb/
 ├── internal/
-│   ├── wal/            <- write-ahead log (this phase)
-│   ├── memtable/           (next)
-│   ├── sstable/            (next)
-│   └── db/                 (later -- ties it all together)
+│   ├── wal/             <- write-ahead log (Phase 1)
+│   ├── memtable/         <- skip list + memtable wrapper (Phase 2)
+│   ├── sstable/             (next)
+│   └── db/                  (later -- ties it all together)
 └── cmd/
     └── lsmdb-cli/       <- demo/debug CLI
 ```
