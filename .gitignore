@@ -1,0 +1,4 @@
+bin/
+*.wal
+*.test
+*.out
