@@ -8,23 +8,34 @@ import (
 	"io"
 	"os"
 	"sort"
+	"sync/atomic"
+
+	"github.com/sujanuj/lsmdb/internal/bloom"
 )
 
 // Reader provides read access to an existing, immutable SSTable file.
-// Opening a Reader loads only the index block into memory — the
-// (potentially much larger) data chunks are read and decompressed lazily,
-// only the specific chunk(s) a Get or iteration actually needs.
+// Opening a Reader loads the index block AND the bloom filter into
+// memory — both are sized to stay small relative to the data by
+// construction, so this remains cheap. The (potentially much larger)
+// data chunks are still read and decompressed lazily, only when the
+// bloom filter can't rule out a key's presence.
 type Reader struct {
 	path       string
 	index      []indexEntry
+	filter     *bloom.Filter
 	numEntries int
+
+	// Stats, for demos/benchmarks showing the filter's actual effect —
+	// not used for any correctness decision.
+	bloomSkips  uint64 // Gets that the filter ruled out without touching disk
+	bloomMisses uint64 // Gets where the filter said "maybe" and the chunk check confirmed absence (a false positive)
 }
 
-// Open reads the footer and index block of the SSTable at path, without
-// touching any data chunks. This is intentionally cheap: footer is a
-// fixed size at a fixed position (seek to end, read backward), and the
-// index is sized to be small relative to the data by construction
-// (entriesPerChunk controls exactly this tradeoff).
+// Open reads the footer, index block, and bloom filter of the SSTable at
+// path, without touching any data chunks. This is intentionally cheap:
+// the footer is a fixed size at a fixed position (seek to end, read
+// backward), and both the index and the filter are sized to be small
+// relative to the data by construction.
 func Open(path string) (*Reader, error) {
 	f, err := os.Open(path)
 	if err != nil {
@@ -47,24 +58,33 @@ func Open(path string) (*Reader, error) {
 
 	indexOffset := binary.LittleEndian.Uint64(footer[0:8])
 	indexLen := binary.LittleEndian.Uint64(footer[8:16])
-	numEntries := binary.LittleEndian.Uint64(footer[16:24])
-	magic := binary.LittleEndian.Uint64(footer[24:32])
+	bloomOffset := binary.LittleEndian.Uint64(footer[16:24])
+	bloomLen := binary.LittleEndian.Uint64(footer[24:32])
+	bloomNumBits := binary.LittleEndian.Uint64(footer[32:40])
+	bloomNumHashes := binary.LittleEndian.Uint64(footer[40:48])
+	numEntries := binary.LittleEndian.Uint64(footer[48:56])
+	magic := binary.LittleEndian.Uint64(footer[56:64])
 
 	if magic != magicNumber {
-		return nil, fmt.Errorf("sstable: %s has invalid magic number %x, not a valid SSTable file (or it's corrupted)", path, magic)
+		return nil, fmt.Errorf("sstable: %s has invalid magic number %x, not a valid SSTable file (or it's corrupted, or it's an older format version)", path, magic)
 	}
 
 	indexBytes := make([]byte, indexLen)
 	if _, err := f.ReadAt(indexBytes, int64(indexOffset)); err != nil {
 		return nil, fmt.Errorf("sstable: read index block of %s: %w", path, err)
 	}
-
 	index, err := decodeIndex(indexBytes)
 	if err != nil {
 		return nil, fmt.Errorf("sstable: decode index of %s: %w", path, err)
 	}
 
-	return &Reader{path: path, index: index, numEntries: int(numEntries)}, nil
+	bloomBytes := make([]byte, bloomLen)
+	if _, err := f.ReadAt(bloomBytes, int64(bloomOffset)); err != nil {
+		return nil, fmt.Errorf("sstable: read bloom filter of %s: %w", path, err)
+	}
+	filter := bloom.FromBytes(bloomBytes, bloomNumBits, int(bloomNumHashes))
+
+	return &Reader{path: path, index: index, filter: filter, numEntries: int(numEntries)}, nil
 }
 
 // NumEntries returns the total entry count recorded in the footer,
@@ -72,6 +92,14 @@ func Open(path string) (*Reader, error) {
 // footer, no chunk reads needed.
 func (r *Reader) NumEntries() int {
 	return r.numEntries
+}
+
+// BloomSkips returns how many Get calls were answered as "definitely
+// absent" purely from the in-memory bloom filter, with zero chunk reads
+// or decompression. Exposed for demos/benchmarks; not used internally
+// for any correctness decision.
+func (r *Reader) BloomSkips() uint64 {
+	return atomic.LoadUint64(&r.bloomSkips)
 }
 
 // Get looks up key, returning its value and whether it was found as a
@@ -90,11 +118,24 @@ func (r *Reader) Get(key []byte) (value []byte, found bool) {
 // GetWithTombstone is the full-fidelity lookup: existsHere reports
 // whether this SSTable contains any entry for key at all, and isDeleted
 // distinguishes a tombstone from a live value. This mirrors
-// memtable.Memtable.GetWithTombstone deliberately — the read path that
-// will be built in Phase 4 needs to walk memtable -> newest SSTable ->
-// older SSTables and stop as soon as ANY layer reports existsHere=true,
-// using isDeleted to decide the final answer.
+// memtable.Memtable.GetWithTombstone deliberately — the db package's
+// multi-level Get walks memtable -> newest SSTable -> older SSTables and
+// stops as soon as ANY layer reports existsHere=true, using isDeleted to
+// decide the final answer.
+//
+// Before touching disk at all, this consults the bloom filter: if it
+// reports the key is definitely absent, that's authoritative (bloom
+// filters never produce false negatives) and we return immediately,
+// skipping the chunk lookup, the disk read, and the gzip decompression
+// entirely. This is the entire point of building the filter — turning
+// the common case of "key genuinely isn't in this file" from a disk read
+// into an in-memory bit check.
 func (r *Reader) GetWithTombstone(key []byte) (value []byte, existsHere bool, isDeleted bool) {
+	if !r.filter.MightContain(key) {
+		atomic.AddUint64(&r.bloomSkips, 1)
+		return nil, false, false
+	}
+
 	chunkIdx := r.findChunk(key)
 	if chunkIdx < 0 {
 		return nil, false, false // key is before the first chunk's first key
@@ -106,7 +147,7 @@ func (r *Reader) GetWithTombstone(key []byte) (value []byte, existsHere bool, is
 		// file indicates disk corruption or a bug, not a normal "key
 		// missing" case. Surfacing it as "not found" would silently
 		// hide data loss, so this is deliberately not swallowed here —
-		// Phase 4 callers should propagate or log this loudly.
+		// callers should propagate or log this loudly.
 		return nil, false, false
 	}
 
@@ -118,6 +159,11 @@ func (r *Reader) GetWithTombstone(key []byte) (value []byte, existsHere bool, is
 		return bytes.Compare(entries[i].Key, key) >= 0
 	})
 	if idx >= len(entries) || !bytes.Equal(entries[idx].Key, key) {
+		// The bloom filter said "maybe" but the key genuinely isn't
+		// here — a true false positive. Expected at roughly the
+		// filter's configured rate; tracked for observability, not
+		// treated as an error.
+		atomic.AddUint64(&r.bloomMisses, 1)
 		return nil, false, false
 	}
 

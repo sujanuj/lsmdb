@@ -32,7 +32,7 @@ layer work, rather than depend on one.
 - [x] Integration test proving `wal.Replay` correctly rebuilds a memtable —
       including overwrites and tombstones surviving the replay exactly
 
-**Phase 3 (current): SSTable**
+**Phase 3: SSTable — done**
 
 - [x] Chunked, gzip-compressed data blocks (64 entries per chunk)
 - [x] Sparse index over chunks, loaded fully into memory on `Open`
@@ -45,12 +45,40 @@ layer work, rather than depend on one.
       (simulating a crash restart) -> flush to SSTable -> fresh read of the
       file, confirming an overwrite and a delete both survive the entire chain
 - [x] Measured real compression ratio on repetitive data (logged in tests:
-      255KB of repetitive payload compresses to ~3.3KB, about 1.3% of original)
+      255KB of repetitive payload compresses to ~1.5% of original, including
+      the bloom filter added in Phase 4)
+
+**Phase 4 (current): Multi-level reads + bloom filters**
+
+- [x] `internal/db`: a unified `DB` type wiring WAL + memtable + N SSTables
+      into one `Get`/`Put`/`Delete` API
+- [x] Multi-level `Get`: checks the memtable first, then every SSTable from
+      newest to oldest, stopping at the first layer with ANY entry for the
+      key (live or tombstone) — proven with a test where the same key has
+      different values across 2 SSTables and an unflushed memtable write,
+      and the newest always wins
+- [x] Tombstone shadowing across SSTable generations: a delete recorded in
+      a newer SSTable correctly hides a live value sitting in an older one
+- [x] Restart correctness: closing and reopening a `DB` rediscovers existing
+      SSTable files in the right age order and replays the WAL on top —
+      proven with a real close/reopen test, not just a single long-lived
+      instance
+- [x] From-scratch bloom filter (`internal/bloom`) using double hashing
+      (2 real hash computations simulating k≈7 hash functions via
+      `h1 + i*h2`), sized from the standard m/n and k derivation for a
+      target 1% false-positive rate (~9.6 bits/key)
+- [x] Bloom filter measured directly: 50,000 keys added with zero false
+      negatives; measured false-positive rate 0.47% against a 1% target
+      across 100,000 disjoint probes
+- [x] Bloom filter wired into the SSTable file format itself (written
+      between the data chunks and the index, loaded on `Open`) and
+      consulted before any chunk read — measured 98.95% of genuinely-absent
+      key lookups resolved with zero disk reads
+- [x] File format version bumped (magic number changed) since the on-disk
+      layout changed — a v0 reader will correctly refuse to misparse a v1 file
 
 **Planned:**
 
-- [ ] Multi-level reads (memtable -> newest SSTable -> older SSTables)
-- [ ] Bloom filters per SSTable (skip whole files that can't contain a key)
 - [ ] Compaction (size-tiered, to start)
 - [ ] Range scans (k-way merge iterator across memtable + multiple SSTables)
 - [ ] Benchmark suite vs. SQLite and BoltDB
@@ -138,6 +166,73 @@ benchmark (Phase 6) is what would justify moving it.
   costs under load — see "what I'd change at scale" for why this is a
   deliberate scope cut for now rather than an oversight.
 
+## Multi-level reads: how Get actually decides the answer
+
+```
+DB.Get(key):
+  1. Check the memtable (newest data) via GetWithTombstone
+     -> existsHere? return immediately (live value, or "not found" if tombstoned)
+  2. Check SSTables from NEWEST to OLDEST, same GetWithTombstone check
+     -> first one that existsHere wins, stop walking further
+  3. Nothing anywhere had it -> truly not found
+```
+
+The reason every layer reports `(value, existsHere, isDeleted)` instead of
+just `(value, found)` is exactly to make step 2 correct: a tombstone in a
+newer SSTable must be able to shadow a real value sitting in an older one,
+and the only way to know to *stop* at the tombstone (rather than keep
+looking and find the stale value underneath) is for the tombstone to report
+"yes, I exist here" even though it's logically a deletion.
+
+SSTables are tracked oldest-first in a slice, because that's the order
+flushes naturally produce — each new flush just appends. Reads walk the
+slice backward (`for i := len-1; i >= 0; i--`) to check newest-first, which
+needs zero extra bookkeeping beyond that ordering.
+
+**A known durability gap, named explicitly:** flushing the memtable to a new
+SSTable does NOT truncate the WAL afterward, even though the flushed data is
+now redundant on disk. Truncating safely requires the flush and the
+truncation to be atomic with respect to a crash in between — if the WAL
+were truncated first and the process died before the SSTable write
+finished, that data would be lost permanently. The current code accepts
+ever-growing WAL files in exchange for correctness; a real fix needs a
+manifest/checkpoint file recording exactly which WAL entries are safely
+captured in which SSTable, written atomically alongside the flush. That's
+exactly the kind of thing "what I'd change at scale" exists to call out.
+
+## Bloom filters: the math and the measured result
+
+For `n` expected keys and a target false-positive rate `p`, the optimal bit
+array size is `m = -n·ln(p) / (ln 2)²` and the optimal number of hash
+functions is `k = (m/n)·ln 2`. At `p = 1%`, this works out to roughly **9.6
+bits per key** and **k ≈ 7** — both derived from the formulas in
+`internal/bloom/bloom.go`, not hardcoded, so the filter sizes itself
+correctly if the target rate changes.
+
+Rather than implementing 7 separate hash functions, the filter uses
+**double hashing** (Kirsch & Mitzenmacher, 2006): two real hash
+computations (`h1`, `h2`, both FNV-1a) combine as `position_i = h1 + i·h2`
+to simulate k independent-enough hash functions. This is the standard
+technique production bloom filters use, not a shortcut taken for this
+project.
+
+The filter is built during the SSTable flush (every key, including
+tombstones — a lookup for a deleted key must still find its tombstone, not
+be incorrectly filtered out) and serialized into the file itself, between
+the data chunks and the index block. `Open` loads it into memory alongside
+the index, and every `Get` consults it before touching the data chunks at
+all: if the filter says "definitely absent," the answer is returned
+immediately, no chunk decompression, no disk read for that chunk.
+
+**Measured, not just asserted:**
+- 50,000 keys added to a filter sized for a 1% target rate: **zero false
+  negatives** across all 50,000 (the one guarantee a bloom filter can never
+  violate)
+- 100,000 probes against guaranteed-absent keys: **0.47% measured
+  false-positive rate** against the 1% target
+- A real SSTable with 5,000 entries, probed with 2,000 genuinely-absent
+  keys: **98.95% resolved by the bloom filter alone**, zero chunk reads
+
 ## Why a WAL first
 
 The WAL is the durability boundary: a write isn't safe until it's recorded here.
@@ -202,8 +297,10 @@ truncated tail.
 ## Running tests
 
 ```bash
-go test ./...          # everything
-go test ./... -race    # with the race detector — important for internal/memtable
+go test ./...          # everything (43 tests as of Phase 4)
+go test ./... -race    # with the race detector
+go test ./internal/bloom/... -v    # see the measured FP rate logged directly
+go test ./internal/sstable/... -run TestBloom -v   # see bloom-skip rate on a real file
 ```
 
 ## Project layout
@@ -214,7 +311,8 @@ lsmdb/
 │   ├── wal/             <- write-ahead log (Phase 1)
 │   ├── memtable/         <- skip list + memtable wrapper (Phase 2)
 │   ├── sstable/           <- chunked, compressed, indexed file format (Phase 3)
-│   └── db/                   (next -- ties it all together)
+│   ├── bloom/             <- from-scratch bloom filter (Phase 4)
+│   └── db/                <- multi-level Get/Put/Delete, ties everything together (Phase 4)
 └── cmd/
     └── lsmdb-cli/       <- demo/debug CLI
 ```

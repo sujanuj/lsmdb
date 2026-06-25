@@ -6,6 +6,8 @@ import (
 	"encoding/binary"
 	"fmt"
 	"os"
+
+	"github.com/sujanuj/lsmdb/internal/bloom"
 )
 
 // entriesPerChunk controls index sparsity: one index entry is recorded
@@ -16,16 +18,26 @@ import (
 // point lookup doesn't do excessive wasted work.
 const entriesPerChunk = 64
 
+// bloomFalsePositiveRate is the target false-positive rate for each
+// SSTable's bloom filter. 1% is a standard default: at this rate the
+// filter costs about 9.6 bits per key, which is small relative to a
+// typical key+value pair, while still turning the large majority of
+// true negatives into an O(1) bit-check instead of a chunk decompress.
+const bloomFalsePositiveRate = 0.01
+
 // magicNumber is written at the very end of the footer as a sanity check:
 // any file that doesn't end with this exact value is either not an
 // SSTable or has been corrupted, and should be rejected rather than
-// silently misinterpreted.
-const magicNumber uint64 = 0x53535441424C4530 // ASCII "SSTABLE0"
+// silently misinterpreted. Bumped from the Phase 3 value (...0530, "0")
+// to ...0531 ("1") because this phase changes the file layout (adding a
+// bloom filter block) — a reader built for format 0 should not silently
+// misparse a format-1 file, and vice versa; mismatched magic numbers
+// make that impossible by construction.
+const magicNumber uint64 = 0x53535441424C4531 // ASCII "SSTABLE1"
 
-// footerSize is fixed and always the same: 3 uint64 fields of metadata
-// plus the magic number. Fixed size is what makes opening a file cheap —
-// seek to (filesize - footerSize), read exactly that many bytes, done.
-const footerSize = 8 * 4 // indexOffset, indexLen, numEntries, magic
+// footerSize: indexOffset, indexLen, bloomOffset, bloomLen, bloomNumBits,
+// bloomNumHashes, numEntries, magic — 8 uint64 fields.
+const footerSize = 8 * 8
 
 // indexEntry records where one compressed chunk lives in the file, and
 // the first key in that chunk (since chunks are written in sorted order,
@@ -45,12 +57,19 @@ type indexEntry struct {
 // the caller using Memtable.All(), which iterates the skip list in
 // sorted order. Write does not sort; doing so here would hide a caller
 // bug instead of surfacing it.
+//
+// A bloom filter covering every key (including tombstoned ones — a
+// lookup for a deleted key still needs to find its tombstone, so it must
+// not be filtered out) is built during the same pass as chunking, then
+// serialized into the file between the data chunks and the index block.
 func Write(path string, entries []Entry) error {
 	f, err := os.Create(path)
 	if err != nil {
 		return fmt.Errorf("sstable: create %s: %w", path, err)
 	}
 	defer f.Close()
+
+	filter := bloom.New(len(entries), bloomFalsePositiveRate)
 
 	var index []indexEntry
 	var offset uint64
@@ -65,6 +84,7 @@ func Write(path string, entries []Entry) error {
 		var raw bytes.Buffer
 		for _, e := range chunk {
 			raw.Write(encodeEntry(e))
+			filter.Add(e.Key)
 		}
 
 		compressed, err := gzipCompress(raw.Bytes())
@@ -85,6 +105,13 @@ func Write(path string, entries []Entry) error {
 		offset += uint64(n)
 	}
 
+	bloomOffset := offset
+	bloomBytes := filter.Bytes()
+	if _, err := f.Write(bloomBytes); err != nil {
+		return fmt.Errorf("sstable: write bloom filter: %w", err)
+	}
+	offset += uint64(len(bloomBytes))
+
 	indexOffset := offset
 	indexBytes := encodeIndex(index)
 	if _, err := f.Write(indexBytes); err != nil {
@@ -94,8 +121,12 @@ func Write(path string, entries []Entry) error {
 	footer := make([]byte, footerSize)
 	binary.LittleEndian.PutUint64(footer[0:8], indexOffset)
 	binary.LittleEndian.PutUint64(footer[8:16], uint64(len(indexBytes)))
-	binary.LittleEndian.PutUint64(footer[16:24], uint64(len(entries)))
-	binary.LittleEndian.PutUint64(footer[24:32], magicNumber)
+	binary.LittleEndian.PutUint64(footer[16:24], bloomOffset)
+	binary.LittleEndian.PutUint64(footer[24:32], uint64(len(bloomBytes)))
+	binary.LittleEndian.PutUint64(footer[32:40], filter.NumBits())
+	binary.LittleEndian.PutUint64(footer[40:48], uint64(filter.NumHashes()))
+	binary.LittleEndian.PutUint64(footer[48:56], uint64(len(entries)))
+	binary.LittleEndian.PutUint64(footer[56:64], magicNumber)
 	if _, err := f.Write(footer); err != nil {
 		return fmt.Errorf("sstable: write footer: %w", err)
 	}
@@ -109,8 +140,8 @@ func Write(path string, entries []Entry) error {
 	// layer down, at real cost (gzip + fsync on every flush). A
 	// production engine would still want to fsync the SSTable + update
 	// a manifest atomically before truncating the corresponding WAL
-	// segment — that ordering is exactly what Phase 4 (the db package
-	// tying WAL+memtable+sstable together) needs to get right.
+	// segment — that ordering is exactly what the db package's flush
+	// path notes as a real, deliberate gap for now.
 	return nil
 }
 
