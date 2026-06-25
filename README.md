@@ -20,7 +20,7 @@ layer work, rather than depend on one.
       byte the file is cut off at
 - [x] A live kill-9 demo (`cmd/lsmdb-cli`) for actually watching recovery happen
 
-**Phase 2 (current): Memtable**
+**Phase 2: Memtable — done**
 
 - [x] Skip list with a from-scratch xorshift64* PRNG for level promotion
 - [x] Put / Get / Delete (tombstone, not physical removal) / sorted iteration
@@ -32,13 +32,27 @@ layer work, rather than depend on one.
 - [x] Integration test proving `wal.Replay` correctly rebuilds a memtable —
       including overwrites and tombstones surviving the replay exactly
 
+**Phase 3 (current): SSTable**
+
+- [x] Chunked, gzip-compressed data blocks (64 entries per chunk)
+- [x] Sparse index over chunks, loaded fully into memory on `Open`
+- [x] Fixed-size footer with a magic number for fast, safe file validation
+- [x] Point lookup (`Get`): binary search the index, decompress one chunk, scan it
+- [x] Tombstones survive serialization and are distinguishable from
+      "never existed" via `GetWithTombstone`
+- [x] Full sorted iteration (`All`) for future compaction/range scans
+- [x] End-to-end integration test: WAL write -> replay into a fresh memtable
+      (simulating a crash restart) -> flush to SSTable -> fresh read of the
+      file, confirming an overwrite and a delete both survive the entire chain
+- [x] Measured real compression ratio on repetitive data (logged in tests:
+      255KB of repetitive payload compresses to ~3.3KB, about 1.3% of original)
+
 **Planned:**
 
-- [ ] SSTable file format + flush from memtable
-- [ ] Bloom filters per SSTable
 - [ ] Multi-level reads (memtable -> newest SSTable -> older SSTables)
+- [ ] Bloom filters per SSTable (skip whole files that can't contain a key)
 - [ ] Compaction (size-tiered, to start)
-- [ ] Range scans (k-way merge iterator)
+- [ ] Range scans (k-way merge iterator across memtable + multiple SSTables)
 - [ ] Benchmark suite vs. SQLite and BoltDB
 
 ## Why a skip list, not a balanced tree, for the memtable
@@ -69,6 +83,60 @@ Writing a tombstone — itself a real entry that gets flushed and eventually
 removed during compaction once it's provably shadowed every older version of
 the key — is the standard LSM technique for making deletes correct across the
 whole multi-level structure.
+
+## SSTable file format
+
+An SSTable is written once, in full, and never modified — compaction (Phase
+4) produces brand-new files rather than editing existing ones. The format:
+
+```
+┌─────────────────────────────────────┐
+│  Chunk 0 (gzip-compressed)           │  entries 0-63, compressed together
+├─────────────────────────────────────┤
+│  Chunk 1 (gzip-compressed)           │  entries 64-127
+├─────────────────────────────────────┤
+│  ...                                 │
+├─────────────────────────────────────┤
+│  Index block                         │  [firstKey][offset][length] per chunk
+├─────────────────────────────────────┤
+│  Footer (fixed 32 bytes)             │  indexOffset, indexLen, numEntries, magic
+└─────────────────────────────────────┘
+```
+
+**Why chunk-level compression, not whole-file or per-entry:** compressing the
+entire data block as one blob means a single point lookup has to decompress
+the whole file before reading anything, which defeats the index. Compressing
+each entry individually loses cross-entry redundancy (e.g. repeated key
+prefixes) and adds large per-entry overhead. Grouping entries into
+fixed-size chunks and compressing each one is the actual design RocksDB's
+block-based table format uses — not a simplification invented here.
+
+**Why a sparse index, one entry per chunk (64 entries):** a dense index
+(one entry per key) would be roughly the same size as the data itself,
+losing the entire point of keeping the index in memory. A sparse index over
+chunks stays small enough to fully load on `Open`, and `Get` becomes: binary
+search the in-memory index for the right chunk, decompress just that one
+chunk, linear-scan within it.
+
+**Why a fixed-size footer at the end:** this is what makes `Open` cheap —
+seek to `filesize - footerSize`, read a small fixed struct, and it points
+directly at the index without ever scanning the file. The magic number
+inside the footer is a fast sanity check that the file is actually a valid
+SSTable and not corrupted or unrelated data; `Open` rejects anything else.
+
+**The compression/lookup tradeoff in practice:** every `Get` pays the cost of
+decompressing one full chunk, even though it only needs one entry inside it.
+Smaller chunks reduce wasted decompression per lookup but shrink the
+compression window (less redundancy to exploit) and grow the index. 64
+entries per chunk is a starting point, not a tuned constant — a real
+benchmark (Phase 6) is what would justify moving it.
+
+## Known simplifications in this phase
+
+- `Reader.readChunk` re-opens the file on every call rather than holding it
+  open across calls, and doesn't cache decompressed chunks. Both are real
+  costs under load — see "what I'd change at scale" for why this is a
+  deliberate scope cut for now rather than an oversight.
 
 ## Why a WAL first
 
@@ -145,8 +213,8 @@ lsmdb/
 ├── internal/
 │   ├── wal/             <- write-ahead log (Phase 1)
 │   ├── memtable/         <- skip list + memtable wrapper (Phase 2)
-│   ├── sstable/             (next)
-│   └── db/                  (later -- ties it all together)
+│   ├── sstable/           <- chunked, compressed, indexed file format (Phase 3)
+│   └── db/                   (next -- ties it all together)
 └── cmd/
     └── lsmdb-cli/       <- demo/debug CLI
 ```
