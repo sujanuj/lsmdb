@@ -48,7 +48,7 @@ layer work, rather than depend on one.
       255KB of repetitive payload compresses to ~1.5% of original, including
       the bloom filter added in Phase 4)
 
-**Phase 4 (current): Multi-level reads + bloom filters**
+**Phase 4: Multi-level reads + bloom filters — done**
 
 - [x] `internal/db`: a unified `DB` type wiring WAL + memtable + N SSTables
       into one `Get`/`Put`/`Delete` API
@@ -60,27 +60,68 @@ layer work, rather than depend on one.
 - [x] Tombstone shadowing across SSTable generations: a delete recorded in
       a newer SSTable correctly hides a live value sitting in an older one
 - [x] Restart correctness: closing and reopening a `DB` rediscovers existing
-      SSTable files in the right age order and replays the WAL on top —
-      proven with a real close/reopen test, not just a single long-lived
-      instance
+      SSTable files in the right age order and replays the WAL on top
 - [x] From-scratch bloom filter (`internal/bloom`) using double hashing
       (2 real hash computations simulating k≈7 hash functions via
       `h1 + i*h2`), sized from the standard m/n and k derivation for a
       target 1% false-positive rate (~9.6 bits/key)
 - [x] Bloom filter measured directly: 50,000 keys added with zero false
-      negatives; measured false-positive rate 0.47% against a 1% target
+      negatives; measured false-positive rate ~0.5% against a 1% target
       across 100,000 disjoint probes
-- [x] Bloom filter wired into the SSTable file format itself (written
-      between the data chunks and the index, loaded on `Open`) and
-      consulted before any chunk read — measured 98.95% of genuinely-absent
-      key lookups resolved with zero disk reads
-- [x] File format version bumped (magic number changed) since the on-disk
-      layout changed — a v0 reader will correctly refuse to misparse a v1 file
+- [x] Bloom filter wired into the SSTable file format itself and consulted
+      before any chunk read — measured ~99% of genuinely-absent key
+      lookups resolved with zero disk reads
+
+**Phase 5: Compaction — done**
+
+- [x] `internal/compaction`: a from-scratch k-way merge over N sorted
+      entry streams using a min-heap, where ties on the same key are
+      broken by generation (newer wins)
+- [x] Size-tiered compaction policy (`PickCompactionCandidates`): groups
+      SSTables into tiers by size (within a 2x ratio of each other) and
+      triggers a compaction pass once a tier accumulates 4 files
+- [x] A conservative, always-safe tombstone-dropping rule
+      (`ShouldDropTombstones`): only physically discards a tombstone if
+      the compaction reaches back to the oldest file in the database —
+      makes the "delete undoes itself" bug class structurally impossible
+- [x] Wired into `db.DB`: every flush checks the policy and performs a
+      real compaction pass automatically, end to end on real files on disk
+- [x] Cross-checked against a hand-written reference implementation across
+      thousands of overlapping keys with deletes mixed in
+- [x] A real stress test: 30 rounds x 50 keys with overwrites and periodic
+      deletes, collapsing from 30 flushes down to single digits of files,
+      every key verified against an independent reference map
+
+**Phase 6 (current): Range scans**
+
+- [x] `internal/iterator`: the k-way merge heap logic extracted out of
+      `compaction.Merge` into a standalone, genuinely lazy `MergeIterator`
+      — pulling one entry at a time via `Next()`, consuming only as much
+      of the underlying sorted streams as has actually been asked for
+- [x] `compaction.Merge` refactored to be a thin wrapper around
+      `MergeIterator` (drain + optional tombstone drop) — re-verified with
+      every existing Phase 5 test still passing unchanged after the
+      refactor, proving the extraction didn't alter behavior
+- [x] `db.DB.Scan(start, end)`: returns a `ScanIterator` over every live
+      key in `[start, end]` (inclusive both ends; pass `nil` for either
+      bound to mean unbounded), built from the memtable + every SSTable as
+      one merge, with the memtable correctly treated as the newest
+      generation regardless of how many SSTables exist
+- [x] Tombstones are skipped by `Scan` (a deleted key never appears in
+      scan results) but never physically dropped by it — that's
+      compaction's job, under very different safety rules; a read
+      operation must never mutate on-disk state
+- [x] `Scan` takes a consistent snapshot of the current memtable + SSTable
+      state at call time; concurrent writes during iteration are not
+      reflected — a deliberate, named tradeoff rather than an accidental gap
+- [x] Proven with: range-boundary tests (inclusive on both ends, start-only,
+      end-only, no-match ranges), tombstone-skipping, memtable-over-SSTable
+      precedence (the same shadowing rule `Get` uses), multi-SSTable overlap,
+      and a large cross-check against an independently-tracked reference map
+      spanning multiple flushes
 
 **Planned:**
 
-- [ ] Compaction (size-tiered, to start)
-- [ ] Range scans (k-way merge iterator across memtable + multiple SSTables)
 - [ ] Benchmark suite vs. SQLite and BoltDB
 
 ## Why a skip list, not a balanced tree, for the memtable
@@ -233,6 +274,152 @@ immediately, no chunk decompression, no disk read for that chunk.
 - A real SSTable with 5,000 entries, probed with 2,000 genuinely-absent
   keys: **98.95% resolved by the bloom filter alone**, zero chunk reads
 
+## Compaction: why it exists and how it's safe
+
+Without compaction, every overwrite and every delete just adds another
+entry to a new SSTable, while the stale old entry sits untouched in an
+older file forever. `DB.Get` already knows to skip stale data (newest
+layer wins), but the disk space and the file count both grow without
+bound. Compaction is the process that periodically rewrites a set of
+SSTables into one, physically discarding anything that's been shadowed.
+
+### The merge: a k-way merge with generation-based shadowing
+
+`internal/compaction.Merge` takes N sorted entry streams (oldest first,
+same convention `db.DB.sstables` uses) and produces one sorted stream,
+using a min-heap (`container/heap`) to always emit the globally smallest
+key next. When the same key appears in multiple input streams, the
+heap's tie-break rule (higher generation — i.e. newer — sorts first)
+guarantees the newest entry for that key is the one that survives; every
+older duplicate for that key is read and then discarded. This is the
+exact same "newest wins" rule `DB.Get` uses for shadowing, just applied
+once during compaction instead of being re-evaluated on every single
+read afterward.
+
+### The dangerous bug this is built to avoid
+
+A tombstone existing in a newer file must be able to shadow a real value
+sitting in an older file. If a tombstone gets *physically dropped*
+during a compaction that doesn't actually include every older copy of
+that key, the dropped tombstone stops shadowing anything — and on the
+next read, an even-older value for that key can resurface as if it had
+never been deleted. This is the textbook LSM compaction bug, and it's
+exactly why `dropObsoleteTombstones` in `Merge` is a parameter the merge
+itself doesn't decide on its own — the safety reasoning lives one level
+up, in the policy.
+
+### The safety rule: conservative by design
+
+`ShouldDropTombstones` only allows dropping tombstones when the
+compaction's candidate set reaches all the way back to age index 0 — the
+oldest file in the whole database. If there's any older file *outside*
+this compaction, tombstones are kept, full stop, even if it's overwhelmingly
+likely none of them actually still need to shadow anything in that older
+file. This trades a small amount of unnecessary tombstone longevity for
+making the dangerous failure mode (a delete silently undoing itself)
+structurally impossible to trigger — checking real per-key safety against
+every older file's actual contents would require reading those files on
+every compaction decision, which defeats the entire point of compaction
+being bounded work.
+
+### Size-tiered policy
+
+```
+PickCompactionCandidates groups SSTables into tiers by size (within a 2x
+ratio of each other) and returns the first tier that has reached
+SizeTierThreshold (4) files. A compacted file naturally lands in a larger
+tier, where it waits for peers of ITS size to accumulate before compacting
+again — this is what makes file count grow logarithmically rather than
+linearly with total writes, even though each individual compaction pass
+is bounded work.
+```
+
+This mirrors Cassandra's Size-Tiered Compaction Strategy at a conceptual
+level: lots of small files compact into fewer medium files, which
+eventually compact into fewer large files, rather than re-merging the
+entire dataset on every single flush (which would make every write pay
+for the full size of the database, an obviously bad tradeoff at scale).
+
+## Range scans: reusing compaction's merge, properly this time
+
+A range scan ("give me every live key between X and Y, in order") is
+structurally the same problem compaction's merge already solves — many
+sorted sources, same-key collisions resolved by "newest generation wins"
+— with three differences: it includes the **memtable** (compaction never
+touches the memtable, only flushed SSTables), it filters to a key range,
+and it must **never** drop tombstones (a scan is a read; physically
+discarding data is compaction's job, under much more careful safety
+rules).
+
+Rather than duplicating the heap logic in a second place, the original
+`compaction.Merge` heap implementation was extracted into
+`internal/iterator.MergeIterator` — a genuinely lazy, pull-based
+iterator. `compaction.Merge` is now a thin wrapper that drains the
+iterator into a slice (with optional tombstone-dropping); `db.DB.Scan`
+wraps the same iterator with a range filter and tombstone-skipping,
+pulling one entry at a time instead of materializing the whole merge.
+
+**This was a real refactor of working, already-tested code, treated
+accordingly:** every one of Phase 5's compaction tests was re-run
+immediately after the extraction and confirmed to still pass unchanged —
+that's what actually justifies calling the refactor "behavior-preserving"
+rather than just hoping it is.
+
+```go
+type ScanIterator struct { /* wraps a MergeIterator + range bounds */ }
+
+func (s *ScanIterator) Next() (key, value []byte, ok bool) {
+    for {
+        entry, ok := s.inner.Next()
+        if !ok { return nil, nil, false }
+        if pastEnd(entry.Key)    { return nil, nil, false } // sorted output -> safe to stop entirely
+        if beforeStart(entry.Key) { continue }               // keep pulling
+        if entry.Op == OpDelete   { continue }                // skip, never surface, never drop on disk
+        return entry.Key, entry.Value, true
+    }
+}
+```
+
+Because the underlying merge always yields keys in ascending order, the
+moment a key is past the end of the range, *every subsequent key* will
+be too — so `Next` can stop the whole scan right there instead of just
+skipping one entry, which keeps a bounded scan over a huge dataset cheap
+even when the dataset itself is far larger than the requested range.
+
+**Range convention:** `[start, end]`, inclusive on both ends. `nil` for
+either bound means unbounded in that direction — `Scan(nil, nil)` is a
+full scan.
+
+**A named limitation, not a hidden one:** `Scan` takes a snapshot of the
+memtable and SSTable state at the moment it's called. A write that
+happens while a caller is still iterating is not reflected in that scan.
+A live-updating scan would need either copy-on-write memtable semantics
+or holding the engine's lock for the scan's entire duration (which would
+block every other write for as long as the scan takes) — both real
+options, neither implemented here, and worth being explicit about rather
+than letting a caller discover it by surprise.
+
+### What's deliberately NOT built in compaction or scans
+
+- **Background/async compaction.** `db.DB` runs exactly one compaction
+  pass synchronously inside the `Flush`/`Put`/`Delete` call that triggers
+  it, holding the same lock as every other operation. A production engine
+  runs compaction on a background goroutine so writes aren't blocked
+  waiting for a merge to finish — that's a real, deliberate scope cut
+  named here rather than discovered by surprise.
+- **Per-key tombstone safety analysis.** As described above — the
+  conservative whole-tier rule is intentional, not a missing optimization.
+- **Leveled compaction** (RocksDB/LevelDB's default strategy, which
+  organizes files into non-overlapping key-range levels rather than
+  size tiers). Size-tiered was chosen for this phase because it's
+  conceptually simpler to reason about and test correctly; leveled
+  compaction's main advantage is bounding the worst-case number of files
+  a single key could be spread across, at the cost of more total bytes
+  rewritten over time (higher write amplification, lower space amplification —
+  a real tradeoff between the two strategies that's worth being able to name).
+- **Live-updating scans.** As described above — `Scan` is a snapshot, not
+  a subscription.
+
 ## Why a WAL first
 
 The WAL is the durability boundary: a write isn't safe until it's recorded here.
@@ -297,10 +484,10 @@ truncated tail.
 ## Running tests
 
 ```bash
-go test ./...          # everything (43 tests as of Phase 4)
+go test ./...          # everything (85 tests as of Phase 6)
 go test ./... -race    # with the race detector
-go test ./internal/bloom/... -v    # see the measured FP rate logged directly
-go test ./internal/sstable/... -run TestBloom -v   # see bloom-skip rate on a real file
+go test ./internal/iterator/... -v        # the shared lazy merge iterator
+go test ./internal/db/... -run TestScan -v   # range scan correctness, boundaries, tombstones
 ```
 
 ## Project layout
@@ -312,7 +499,9 @@ lsmdb/
 │   ├── memtable/         <- skip list + memtable wrapper (Phase 2)
 │   ├── sstable/           <- chunked, compressed, indexed file format (Phase 3)
 │   ├── bloom/             <- from-scratch bloom filter (Phase 4)
-│   └── db/                <- multi-level Get/Put/Delete, ties everything together (Phase 4)
+│   ├── iterator/          <- shared lazy k-way merge iterator (Phase 6, extracted from compaction)
+│   ├── compaction/        <- size-tiered policy + Merge (thin wrapper over iterator, Phase 5)
+│   └── db/                <- Get/Put/Delete/Scan + compaction trigger, ties everything together
 └── cmd/
     └── lsmdb-cli/       <- demo/debug CLI
 ```

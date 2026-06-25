@@ -128,8 +128,16 @@ func TestKeyOnlyInOldestSSTableStillFound(t *testing.T) {
 		}
 	}
 
-	if database.SSTableCount() != 4 {
-		t.Fatalf("SSTableCount() = %d, want 4", database.SSTableCount())
+	// Note: these 4 flushes are similarly sized, which is exactly the
+	// size-tiered compaction trigger condition (Phase 5) — so they may
+	// have already been merged into a single file by the time we check.
+	// That's fine and actually a stronger test of the real claim here:
+	// "ancient" must survive even after compaction has physically
+	// rewritten the data, not just while it's sitting untouched in the
+	// original file. What matters is SSTableCount() is no MORE than 4
+	// (no duplication) and the key is still correctly found.
+	if database.SSTableCount() > 4 || database.SSTableCount() < 1 {
+		t.Fatalf("SSTableCount() = %d, want between 1 and 4", database.SSTableCount())
 	}
 
 	got, found := database.Get([]byte("ancient"))
@@ -226,8 +234,14 @@ func TestSSTableFileNamingSurvivesGaps(t *testing.T) {
 	}
 	defer reopened.Close()
 
-	if reopened.SSTableCount() != numFlushes {
-		t.Fatalf("SSTableCount() = %d, want %d", reopened.SSTableCount(), numFlushes)
+	// Same note as TestKeyOnlyInOldestSSTableStillFound: 12 similarly-
+	// sized flushes will trigger size-tiered compaction (Phase 5) along
+	// the way, so the final file count is likely well under 12. The
+	// actual claim being tested — every key survives, file naming and
+	// discovery work correctly on reopen — holds regardless of exactly
+	// how much compaction happened.
+	if reopened.SSTableCount() < 1 || reopened.SSTableCount() > numFlushes {
+		t.Fatalf("SSTableCount() = %d, want between 1 and %d", reopened.SSTableCount(), numFlushes)
 	}
 	for i := 0; i < numFlushes; i++ {
 		key := fmt.Sprintf("key-%d", i)

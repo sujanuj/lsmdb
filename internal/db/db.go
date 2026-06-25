@@ -7,11 +7,15 @@
 package db
 
 import (
+	"bytes"
 	"fmt"
 	"os"
 	"path/filepath"
+	"sort"
 	"sync"
 
+	"github.com/sujanuj/lsmdb/internal/compaction"
+	"github.com/sujanuj/lsmdb/internal/iterator"
 	"github.com/sujanuj/lsmdb/internal/memtable"
 	"github.com/sujanuj/lsmdb/internal/sstable"
 	"github.com/sujanuj/lsmdb/internal/wal"
@@ -38,8 +42,9 @@ type DB struct {
 	// the newest SSTable is always sstables[len(sstables)-1] — reads
 	// walk this slice backward to check newest-to-oldest, which matches
 	// the order flushes naturally produce with zero extra bookkeeping.
-	sstables []*sstable.Reader
-	nextSST  int // next numeric suffix to assign on flush
+	sstables     []*sstable.Reader
+	sstablePaths []string // parallel to sstables; needed to delete old files during compaction
+	nextSST      int      // next numeric suffix to assign on flush/compaction
 }
 
 // Open opens (creating if necessary) a database rooted at dataDir. If a
@@ -93,11 +98,12 @@ func Open(dataDir string) (*DB, error) {
 	}
 
 	return &DB{
-		dataDir:  dataDir,
-		wal:      log,
-		memtable: mt,
-		sstables: readers,
-		nextSST:  maxSeq + 1,
+		dataDir:      dataDir,
+		wal:          log,
+		memtable:     mt,
+		sstables:     readers,
+		sstablePaths: sstPaths,
+		nextSST:      maxSeq + 1,
 	}, nil
 }
 
@@ -218,10 +224,11 @@ func (db *DB) flushLocked() error {
 	}
 
 	db.sstables = append(db.sstables, reader)
+	db.sstablePaths = append(db.sstablePaths, path)
 	db.nextSST++
 	db.memtable = memtable.New(0)
 
-	return nil
+	return db.maybeCompactLocked()
 }
 
 // Flush forces an immediate flush of the current memtable, even if it
@@ -243,4 +250,237 @@ func (db *DB) SSTableCount() int {
 
 func sstableFileName(seq int) string {
 	return fmt.Sprintf("sstable-%06d.sst", seq)
+}
+
+// maybeCompactLocked checks the size-tiered policy against the current
+// set of SSTables and, if a tier has accumulated enough files, performs
+// exactly one compaction pass. Only one pass per call (not a loop) is
+// deliberate: compaction can itself create a file that's now large
+// enough to belong to the NEXT tier up, and checking again immediately
+// would mean one flush could cascade into compacting every tier in the
+// database synchronously. A real engine runs compaction as a background
+// process for exactly this reason; doing one pass per flush call here
+// keeps the demo's behavior easy to reason about and is explicitly named
+// as a scope cut, not an oversight, in the README.
+func (db *DB) maybeCompactLocked() error {
+	if len(db.sstables) == 0 {
+		return nil
+	}
+
+	files := make([]compaction.FileInfo, len(db.sstablePaths))
+	for i, p := range db.sstablePaths {
+		stat, err := os.Stat(p)
+		if err != nil {
+			return fmt.Errorf("db: compaction: stat %s: %w", p, err)
+		}
+		files[i] = compaction.FileInfo{SizeBytes: stat.Size(), AgeIndex: i}
+	}
+
+	candidates := compaction.PickCompactionCandidates(files)
+	if candidates == nil {
+		return nil
+	}
+
+	return db.compactIndicesLocked(candidates)
+}
+
+// compactIndicesLocked merges the SSTables at the given age indices into
+// one new SSTable, removes the old files (both from db's in-memory state
+// and from disk), and inserts the merged result at the correct position
+// in age order. Caller must hold db.mu.
+func (db *DB) compactIndicesLocked(indices []int) error {
+	sort.Ints(indices)
+
+	dropTombstones := compaction.ShouldDropTombstones(indices)
+
+	generations := make([][]sstable.Entry, len(indices))
+	oldPaths := make([]string, len(indices))
+	for i, idx := range indices {
+		entries, err := db.sstables[idx].All()
+		if err != nil {
+			return fmt.Errorf("db: compaction: read sstable at index %d: %w", idx, err)
+		}
+		generations[i] = entries
+		oldPaths[i] = db.sstablePaths[idx]
+	}
+
+	merged := compaction.Merge(generations, dropTombstones)
+
+	newPath := filepath.Join(db.dataDir, sstableFileName(db.nextSST))
+	if len(merged) > 0 {
+		if err := sstable.Write(newPath, merged); err != nil {
+			return fmt.Errorf("db: compaction: write merged sstable: %w", err)
+		}
+	}
+	// If every input key was a droppable tombstone, merged can be empty
+	// — there's nothing to write, and nothing to add back to db.sstables
+	// either, which is correct: those keys are now genuinely gone
+	// everywhere, on disk and in memory.
+
+	removeSet := make(map[int]bool, len(indices))
+	for _, idx := range indices {
+		removeSet[idx] = true
+	}
+
+	var newSSTables []*sstable.Reader
+	var newPaths []string
+	for i := range db.sstables {
+		if !removeSet[i] {
+			newSSTables = append(newSSTables, db.sstables[i])
+			newPaths = append(newPaths, db.sstablePaths[i])
+		}
+	}
+
+	if len(merged) > 0 {
+		reader, err := sstable.Open(newPath)
+		if err != nil {
+			return fmt.Errorf("db: compaction: reopen merged sstable: %w", err)
+		}
+		// The merged file is newer than everything that went into it,
+		// but its actual age relative to files NOT involved in this
+		// compaction depends on where those indices sat. Appending to
+		// the end is correct as long as compaction only ever operates
+		// on a contiguous-from-some-point range that doesn't leave
+		// newer untouched files "behind" it in the slice — which holds
+		// here because PickCompactionCandidates groups by size, and
+		// size tiers in this policy are checked oldest-rolled-up first,
+		// so a tier being compacted is always older than any files not
+		// yet in a same-or-larger tier. This invariant is worth
+		// re-checking carefully if the policy ever changes.
+		newSSTables = append(newSSTables, reader)
+		newPaths = append(newPaths, newPath)
+	}
+
+	db.sstables = newSSTables
+	db.sstablePaths = newPaths
+	db.nextSST++
+
+	for _, p := range oldPaths {
+		if err := os.Remove(p); err != nil {
+			// Not fatal: the old file is now logically dead (excluded
+			// from db.sstables, so nothing will ever read it again),
+			// just wasting disk space until cleaned up manually. Worth
+			// surfacing, not worth failing the whole compaction over,
+			// since the compaction's correctness-relevant work is
+			// already done and committed at this point.
+			fmt.Fprintf(os.Stderr, "db: compaction: warning: failed to remove old sstable %s: %v\n", p, err)
+		}
+	}
+
+	return nil
+}
+
+// Compact forces an immediate compaction check, even outside the normal
+// post-flush trigger. Mainly useful for tests and demos.
+func (db *DB) Compact() error {
+	db.mu.Lock()
+	defer db.mu.Unlock()
+	return db.maybeCompactLocked()
+}
+
+// ScanIterator yields key/value pairs within a scan's range, in sorted
+// order, lazily — each call to Next() does only the work needed to
+// produce that one entry, not the whole range. It wraps an
+// iterator.MergeIterator (the same shared merge logic compaction uses)
+// with two things the raw merge doesn't do on its own: a key-range
+// filter and tombstone-skipping (a scan should never surface a deleted
+// key, but it also must never PHYSICALLY drop the tombstone — that
+// would be compaction's job under very different safety rules, not a
+// read operation's).
+type ScanIterator struct {
+	inner    *iterator.MergeIterator
+	start    []byte
+	end      []byte
+	hasStart bool
+	hasEnd   bool
+}
+
+// Next returns the next live key/value pair within the scan's range, or
+// ok=false once the range is exhausted. Tombstoned keys and keys outside
+// [start, end] are skipped internally — never returned to the caller —
+// without that skipping making the rest of the scan incorrect, since the
+// underlying merge has already resolved which generation wins each key
+// before Next ever sees it.
+func (s *ScanIterator) Next() (key, value []byte, ok bool) {
+	for {
+		entry, ok := s.inner.Next()
+		if !ok {
+			return nil, nil, false
+		}
+
+		if s.hasEnd && bytes.Compare(entry.Key, s.end) > 0 {
+			// Past the end of the range. Since the merge always yields
+			// keys in ascending order, every subsequent entry will also
+			// be past the end — safe to stop the whole scan here rather
+			// than just skipping this one entry.
+			return nil, nil, false
+		}
+		if s.hasStart && bytes.Compare(entry.Key, s.start) < 0 {
+			continue // before the range; keep pulling
+		}
+		if entry.Op == sstable.OpDelete {
+			continue // tombstoned; a scan must never surface a deleted key
+		}
+		return entry.Key, entry.Value, true
+	}
+}
+
+// Scan returns a ScanIterator over all live keys in [start, end]
+// (inclusive on both ends). Pass nil for start to mean "from the very
+// first key" and nil for end to mean "to the very last key" — e.g.
+// Scan(nil, nil) scans the entire keyspace.
+//
+// The returned iterator holds no lock on db and reflects a SNAPSHOT of
+// the memtable and SSTable contents at the moment Scan was called —
+// concurrent writes that happen while the caller is still iterating are
+// not reflected, intentionally. Building a true live-updating scan would
+// require either copy-on-write memtable semantics or holding db's lock
+// for the entire iteration (blocking all writes for as long as the scan
+// takes) — both real options, neither implemented here; see "what I'd
+// change at scale."
+func (db *DB) Scan(start, end []byte) *ScanIterator {
+	db.mu.RLock()
+	defer db.mu.RUnlock()
+
+	// Build the generations oldest-first, exactly like flush/compaction
+	// do: SSTables in their existing age order, then the memtable LAST,
+	// since it's always the newest data regardless of how many SSTables
+	// exist. This is the only place outside flushLocked that constructs
+	// a multi-generation merge input, and getting this ordering wrong
+	// would silently make Scan disagree with Get about which value wins
+	// — worth being deliberate about for exactly that reason.
+	generations := make([][]sstable.Entry, 0, len(db.sstables)+1)
+	for _, r := range db.sstables {
+		entries, err := r.All()
+		if err != nil {
+			// An SSTable read failure here indicates disk corruption or
+			// a bug. Scan has no error return in its public API (Next
+			// just stops), so the safest behavior is to proceed with an
+			// empty generation for this file rather than silently
+			// fabricate data — this means affected keys may appear
+			// missing from the scan rather than wrong, which is the
+			// safer failure direction.
+			entries = nil
+		}
+		generations = append(generations, entries)
+	}
+
+	mtEntries := db.memtable.All()
+	sstEntries := make([]sstable.Entry, len(mtEntries))
+	for i, e := range mtEntries {
+		op := sstable.OpPut
+		if e.Deleted {
+			op = sstable.OpDelete
+		}
+		sstEntries[i] = sstable.Entry{Key: e.Key, Value: e.Value, Op: op}
+	}
+	generations = append(generations, sstEntries)
+
+	return &ScanIterator{
+		inner:    iterator.NewMergeIterator(generations),
+		start:    start,
+		end:      end,
+		hasStart: start != nil,
+		hasEnd:   end != nil,
+	}
 }
