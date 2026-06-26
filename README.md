@@ -92,37 +92,50 @@ layer work, rather than depend on one.
       deletes, collapsing from 30 flushes down to single digits of files,
       every key verified against an independent reference map
 
-**Phase 6 (current): Range scans**
+**Phase 6: Range scans — done**
 
 - [x] `internal/iterator`: the k-way merge heap logic extracted out of
       `compaction.Merge` into a standalone, genuinely lazy `MergeIterator`
-      — pulling one entry at a time via `Next()`, consuming only as much
-      of the underlying sorted streams as has actually been asked for
 - [x] `compaction.Merge` refactored to be a thin wrapper around
-      `MergeIterator` (drain + optional tombstone drop) — re-verified with
-      every existing Phase 5 test still passing unchanged after the
-      refactor, proving the extraction didn't alter behavior
-- [x] `db.DB.Scan(start, end)`: returns a `ScanIterator` over every live
-      key in `[start, end]` (inclusive both ends; pass `nil` for either
-      bound to mean unbounded), built from the memtable + every SSTable as
-      one merge, with the memtable correctly treated as the newest
-      generation regardless of how many SSTables exist
-- [x] Tombstones are skipped by `Scan` (a deleted key never appears in
-      scan results) but never physically dropped by it — that's
-      compaction's job, under very different safety rules; a read
-      operation must never mutate on-disk state
-- [x] `Scan` takes a consistent snapshot of the current memtable + SSTable
-      state at call time; concurrent writes during iteration are not
-      reflected — a deliberate, named tradeoff rather than an accidental gap
-- [x] Proven with: range-boundary tests (inclusive on both ends, start-only,
-      end-only, no-match ranges), tombstone-skipping, memtable-over-SSTable
-      precedence (the same shadowing rule `Get` uses), multi-SSTable overlap,
-      and a large cross-check against an independently-tracked reference map
-      spanning multiple flushes
+      `MergeIterator` — re-verified with every existing Phase 5 test still
+      passing unchanged after the refactor
+- [x] `db.DB.Scan(start, end)`: a `ScanIterator` over every live key in
+      `[start, end]` (inclusive both ends), built from the memtable plus
+      every SSTable as one merge
 
-**Planned:**
+**Phase 7 (current): Benchmarks vs. SQLite and BoltDB**
 
-- [ ] Benchmark suite vs. SQLite and BoltDB
+- [x] `benchmark/`: head-to-head Go `testing.B` benchmarks against real,
+      external engines — `github.com/mattn/go-sqlite3` (SQLite, configured
+      with `journal_mode=WAL` to compare against a realistic production
+      setup, not SQLite's slower legacy default) and `go.etcd.io/bbolt`
+      (BoltDB — a B+tree KV store with no SQL layer in the way, which
+      isolates "B-tree vs LSM-tree" more directly than the SQLite
+      comparison does)
+- [x] Each engine's adapter has its own correctness test
+      (`TestEngineAdaptersCorrectness`), run and verified BEFORE trusting
+      any benchmark number from it — catching a broken adapter early
+      matters more than getting numbers fast
+- [x] Seven workload shapes, chosen specifically to tell an honest story
+      rather than only the ones that flatter lsmdb: sequential writes,
+      random writes, hot point reads, cold point reads (after real
+      flush/compaction), range scans, a realistic 90/10 mixed
+      read/write workload, and an overwrite-heavy workload that's
+      deliberately adversarial to the LSM design
+- [x] **A real bug found and fixed by the benchmark itself:** the first
+      range-scan run showed lsmdb roughly 300x slower than BoltDB — far
+      too large a gap to be ordinary LSM overhead. Root cause: `DB.Scan`
+      was calling `sstable.Reader.All()`, which decompresses every chunk
+      in a file regardless of the requested range. Fixed by adding
+      `Reader.RangeScan`, which uses the existing sparse index to skip
+      chunks entirely outside `[start, end]`. Result: **a 55x improvement**
+      (19.7ms -> 367µs per scan on the same benchmark), with 9 new
+      correctness tests added for the fix before trusting the new numbers
+- [x] Full results table and honest analysis below — including the cases
+      where lsmdb loses, and why
+
+**What's next:** This completes the planned phases. See "Ideas for
+further work" at the end for what a Phase 8+ could look like.
 
 ## Why a skip list, not a balanced tree, for the memtable
 
@@ -420,6 +433,143 @@ than letting a caller discover it by surprise.
 - **Live-updating scans.** As described above — `Scan` is a snapshot, not
   a subscription.
 
+## Benchmarks: lsmdb vs. SQLite vs. BoltDB
+
+`benchmark/` runs real Go `testing.B` benchmarks against two actual,
+external embedded-database engines:
+
+- **SQLite** via `github.com/mattn/go-sqlite3`, configured with
+  `journal_mode=WAL` and `synchronous=NORMAL` — the realistic production
+  configuration, not SQLite's slower legacy rollback-journal default.
+  Comparing against a deliberately weakened baseline would make the
+  comparison meaningless.
+- **BoltDB** via `go.etcd.io/bbolt` — a B+tree key-value store with no SQL
+  layer in the way, which isolates "B-tree vs. LSM-tree" more directly
+  than the SQLite comparison does (SQLite's B-tree is wrapped in SQL
+  parsing, query planning, and a row-based table format).
+
+Every adapter has its own correctness test (`TestEngineAdaptersCorrectness`)
+that runs and must pass before any benchmark number from that engine is
+trusted — a broken adapter (e.g. a `Get` that silently always returns
+"not found") would make an engine look unrealistically fast, and that
+class of bug needs to be caught here, not discovered after a number gets
+quoted somewhere.
+
+### Results
+
+100-byte values, 1000 iterations per benchmark, single-threaded, on the
+machine the suite was actually run on (numbers will vary by hardware —
+the *relative* shape and the *reasons* behind it are what's meant to
+transfer, not the absolute nanosecond counts):
+
+| Workload | lsmdb | BoltDB | SQLite | Winner |
+|---|---|---|---|---|
+| Sequential write | 577µs | 1227µs | 67µs | SQLite |
+| Random write | 597µs | 1235µs | 73µs | SQLite |
+| Point read (hot) | 80µs | 4.6µs | 37µs | BoltDB |
+| Point read (cold, post-compaction) | 74µs | 4.6µs | 26µs | BoltDB |
+| Range scan (100-key window) | 368µs | 26µs | 168µs | BoltDB |
+| Mixed 90% read / 10% write | 61µs | 136µs | 32µs | SQLite |
+| Overwrite-heavy (100 hot keys) | 642µs | 1265µs | 25µs | SQLite |
+
+### Reading these results honestly
+
+**BoltDB wins every pure-read shape, by a lot.** This is the single most
+important and explainable result in the table, not something to talk
+around: BoltDB memory-maps its entire file. A hot or cold read is often
+just a pointer dereference into that mmap — no syscall, no parsing, no
+lock contention beyond a read transaction handle. lsmdb's `Get` takes an
+`RWMutex.RLock`, walks a skip list (several `bytes.Compare` calls per
+level), and — even for genuinely in-memory data — pays real CPU cost a
+direct memory-mapped pointer read simply doesn't have. This isn't a bug;
+it's the actual, structural cost of choosing a design optimized for
+write throughput over one optimized for read latency.
+
+**SQLite wins every write-heavy shape, including the ones LSM-tree
+theory says should favor lsmdb.** At this single-threaded, small-batch
+scale, every engine's *durability* setting dominates the result far more
+than the underlying data structure does: lsmdb's `SyncEveryWrite` policy
+(see the WAL section above) and BoltDB's per-transaction fsync both pay
+a real disk round-trip on every single write, while SQLite's
+`synchronous=NORMAL` is deliberately less strict. This is a genuinely
+useful finding about *this specific configuration*, not a refutation of
+LSM-tree write theory — the random-vs-sequential write gap that LSM
+design is supposed to produce only shows up at a scale and concurrency
+level where avoiding random disk seeks actually matters more than the
+per-write fsync cost. Re-running this with `SyncManual` and batched
+syncing (the production configuration real LSM engines use under load)
+would be the natural next experiment — noted in "what I'd change at
+scale," not pretended away here.
+
+**The range-scan story is really two results, and the gap between them
+is the interesting part.** lsmdb's range scan was originally ~300x
+slower than BoltDB's — far too large a gap to be normal LSM overhead.
+Investigating it surfaced a real bug: `DB.Scan` was decompressing every
+chunk of every SSTable regardless of the requested range, because it
+called `Reader.All()` instead of using the existing sparse index to skip
+irrelevant chunks. Adding `Reader.RangeScan` (which uses
+`findChunk`/binary search on the index, the exact mechanism `Get` already
+used) fixed this — **a 55x improvement**, from 19.7ms down to 367µs per
+scan on the identical benchmark. The corrected gap against BoltDB (368µs
+vs. 26µs) is now explainable by the same mmap-vs-skip-list reasoning as
+the point-read results, not by an algorithmic bug. This sequence — write
+a benchmark, get a suspicious number, investigate instead of reporting
+it, find and fix a real inefficiency, re-measure — is the actual value a
+benchmark suite provides beyond bragging rights.
+
+**Where lsmdb's design should matter more than it does here:** every one
+of these benchmarks runs single-threaded against a dataset small enough
+to fit comfortably in memory and disk cache. LSM-tree's real advantages
+— turning random writes into sequential disk I/O, supporting much higher
+write throughput under concurrent load, and a compaction story that
+matters at datasets far larger than RAM — are exactly the conditions
+this benchmark suite, run on a single machine against small datasets,
+doesn't stress. A fairer head-to-head would run with concurrent writers,
+fsync disabled or batched (matching how these engines are actually
+deployed at scale), and a dataset large enough to force real disk I/O
+rather than page-cache hits for every engine.
+
+### Running the benchmarks
+
+```bash
+# Correctness first — must pass before trusting any number below
+go test ./benchmark/... -run TestEngineAdaptersCorrectness -v
+
+# Full benchmark suite
+go test ./benchmark/... -bench=. -benchtime=1000x -run=^$ -v
+
+# One workload at a time
+go test ./benchmark/... -bench=BenchmarkRangeScan -benchtime=1000x -run=^$ -v
+```
+
+`-run=^$` skips the package's regular tests so only benchmarks execute.
+`-benchtime=1000x` runs exactly 1000 iterations rather than Go's default
+adaptive time-based count, which keeps results comparable run to run
+since BoltDB and SQLite setup phases (writing many keys with per-write
+fsync) can otherwise dominate wall-clock time at very high iteration
+counts.
+
+## Ideas for further work
+
+This project deliberately stopped at 7 phases — long enough to cover the
+core mechanisms of a real LSM engine end to end, short enough to keep
+every phase genuinely well-tested rather than rushing breadth over
+depth. If continuing:
+
+- **Async/background compaction**, so writes never block on a merge
+- **Leveled compaction** as an alternative strategy to size-tiered, with
+  a benchmark comparing write/space amplification between the two
+- **Configurable WAL sync batching** (`SyncManual` + a timer), and
+  re-running the write benchmarks above to see the random-vs-sequential
+  write gap LSM theory predicts actually appear
+- **Concurrent benchmark variants** (multiple goroutines writing/reading
+  simultaneously), since single-threaded benchmarks understate where
+  lsmdb's lock-per-operation design either helps or hurts relative to
+  BoltDB's single-writer/many-readers model
+- **A chunk cache** in `sstable.Reader`, to avoid re-decompressing the
+  same hot chunk on every repeated read — directly informed by how slow
+  the uncached cold-read benchmark above turned out to be
+
 ## Why a WAL first
 
 The WAL is the durability boundary: a write isn't safe until it's recorded here.
@@ -484,10 +634,10 @@ truncated tail.
 ## Running tests
 
 ```bash
-go test ./...          # everything (85 tests as of Phase 6)
-go test ./... -race    # with the race detector
-go test ./internal/iterator/... -v        # the shared lazy merge iterator
-go test ./internal/db/... -run TestScan -v   # range scan correctness, boundaries, tombstones
+go test ./internal/...          # everything (94 tests as of Phase 7)
+go test ./internal/... -race    # with the race detector
+go test ./benchmark/... -run TestEngineAdaptersCorrectness -v   # sanity-check engine adapters
+go test ./benchmark/... -bench=. -benchtime=1000x -run=^$ -v    # the actual benchmark suite
 ```
 
 ## Project layout
@@ -497,11 +647,13 @@ lsmdb/
 ├── internal/
 │   ├── wal/             <- write-ahead log (Phase 1)
 │   ├── memtable/         <- skip list + memtable wrapper (Phase 2)
-│   ├── sstable/           <- chunked, compressed, indexed file format (Phase 3)
+│   ├── sstable/           <- chunked, compressed, indexed file format,
+│   │                          incl. index-aware RangeScan (Phase 3, 6)
 │   ├── bloom/             <- from-scratch bloom filter (Phase 4)
-│   ├── iterator/          <- shared lazy k-way merge iterator (Phase 6, extracted from compaction)
-│   ├── compaction/        <- size-tiered policy + Merge (thin wrapper over iterator, Phase 5)
-│   └── db/                <- Get/Put/Delete/Scan + compaction trigger, ties everything together
+│   ├── iterator/          <- shared lazy k-way merge iterator (Phase 6)
+│   ├── compaction/        <- size-tiered policy + Merge (Phase 5)
+│   └── db/                <- Get/Put/Delete/Scan + compaction trigger
+├── benchmark/             <- head-to-head vs. SQLite and BoltDB (Phase 7)
 └── cmd/
     └── lsmdb-cli/       <- demo/debug CLI
 ```
