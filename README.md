@@ -455,12 +455,23 @@ trusted — a broken adapter (e.g. a `Get` that silently always returns
 class of bug needs to be caught here, not discovered after a number gets
 quoted somewhere.
 
+Both result tables below were independently run end-to-end — `go mod
+tidy`, full build, correctness tests, then the benchmark suite — on two
+separate machines, confirming the suite (and the project it's testing)
+actually builds and runs correctly outside the original development
+environment, not just in the sandbox it was written in.
+
 ### Results
 
-100-byte values, 1000 iterations per benchmark, single-threaded, on the
-machine the suite was actually run on (numbers will vary by hardware —
-the *relative* shape and the *reasons* behind it are what's meant to
-transfer, not the absolute nanosecond counts):
+100-byte values, 1000 iterations per benchmark, single-threaded. Run on
+two genuinely different machines — a Linux x86 sandbox and a real Apple
+M5 MacBook — specifically because a single machine's numbers invite the
+question "does this hold up anywhere else?" The *relative* shape and the
+*reasons* behind each result are what's meant to transfer, not the
+absolute nanosecond counts, which is exactly why running it twice on
+different hardware/OS/filesystem combinations is worth the extra effort.
+
+**Linux x86 sandbox** (`cpu: Intel Xeon @ 2.80GHz`, ext4-family filesystem):
 
 | Workload | lsmdb | BoltDB | SQLite | Winner |
 |---|---|---|---|---|
@@ -472,18 +483,75 @@ transfer, not the absolute nanosecond counts):
 | Mixed 90% read / 10% write | 61µs | 136µs | 32µs | SQLite |
 | Overwrite-heavy (100 hot keys) | 642µs | 1265µs | 25µs | SQLite |
 
+**Apple M5 MacBook** (`goarch: arm64`, APFS):
+
+| Workload | lsmdb | BoltDB | SQLite | Winner |
+|---|---|---|---|---|
+| Sequential write | 3.79ms | 7.90ms | 29.7µs | SQLite |
+| Random write | 3.80ms | 7.95ms | 29.7µs | SQLite |
+| Point read (hot) | 60.0µs | 5.2µs | 4.0µs | SQLite |
+| Point read (cold, post-compaction) | 53.4µs | 5.6µs | 3.8µs | SQLite |
+| Range scan (100-key window) | 172µs | 15.9µs | 32.1µs | BoltDB |
+| Mixed 90% read / 10% write | 370µs | 702µs | 4.5µs | SQLite |
+| Overwrite-heavy (100 hot keys) | 3.67ms | 7.93ms | 14.5µs | SQLite |
+
+### What's consistent across both platforms, and what isn't
+
+**Consistent: SQLite wins essentially every write-heavy shape, on both
+machines, often by 1-2 orders of magnitude.** This is the most robust
+finding in the whole table — it holds regardless of CPU architecture,
+OS, or filesystem, which is exactly the kind of result that's safe to
+generalize from. The explanation (durability settings, not data
+structure) is covered in detail below and applies identically to both
+runs.
+
+**Consistent: lsmdb beats BoltDB on every write-heavy shape, on both
+machines.** Sequential write, random write, and overwrite-heavy all show
+lsmdb roughly 2x faster than BoltDB on both platforms — this is the one
+place the LSM-vs-B-tree theory shows through cleanly and held up under
+a second, independent run on completely different hardware.
+
+**Not consistent: the read-side ranking between BoltDB and SQLite
+flips.** On Linux, BoltDB wins every read shape outright. On the M5,
+SQLite edges out BoltDB on hot reads, cold reads, and the mixed
+workload — though BoltDB still wins the range scan on both platforms.
+This is a genuinely interesting, honestly-reported discrepancy rather
+than something to paper over: it's most plausibly explained by
+differences in how Linux's page cache and macOS's APFS+mmap interact
+differently with BoltDB's pure-mmap read path versus SQLite's own page
+cache, but confirming that precisely would need profiling neither run
+did — reported as an open question, not a confident claim.
+
+**Not consistent: the absolute write costs are roughly 6-7x higher
+across the board on the M5** (lsmdb: 577µs → 3.79ms; BoltDB: 1.2ms →
+7.9ms) **while SQLite's write cost barely moved** (67µs → 30µs, actually
+*faster* on the M5). This single fact does more to explain the whole
+table than anything else: lsmdb and BoltDB both fsync on every write by
+default in this benchmark, and `fsync` cost on APFS is well known to be
+far more conservative than on Linux's typical filesystems — this exact
+asymmetry was already observed independently back in the WAL crash-demo
+in Phase 1 (the same kill-9 demo recovered far fewer records per second
+on macOS than on the Linux sandbox, for the identical reason). SQLite's
+`synchronous=NORMAL` setting is far less sensitive to this per-platform
+fsync cost difference, which is exactly why its numbers stayed stable
+while the two fsync-per-write engines did not.
+
 ### Reading these results honestly
 
-**BoltDB wins every pure-read shape, by a lot.** This is the single most
-important and explainable result in the table, not something to talk
-around: BoltDB memory-maps its entire file. A hot or cold read is often
-just a pointer dereference into that mmap — no syscall, no parsing, no
-lock contention beyond a read transaction handle. lsmdb's `Get` takes an
-`RWMutex.RLock`, walks a skip list (several `bytes.Compare` calls per
-level), and — even for genuinely in-memory data — pays real CPU cost a
-direct memory-mapped pointer read simply doesn't have. This isn't a bug;
-it's the actual, structural cost of choosing a design optimized for
-write throughput over one optimized for read latency.
+**A memory-mapped engine wins essentially every pure-read shape, by a
+lot — though which one depends on the platform (see above).** On Linux,
+that's BoltDB outright; on the M5, SQLite edges it out on most read
+shapes while BoltDB still wins the range scan. Either way, the
+underlying reason is the same and is the single most important and
+explainable result in the table, not something to talk around:
+mmap-based engines turn a hot or cold read into something close to a
+pointer dereference — no syscall, no parsing, no lock contention beyond
+a read transaction handle. lsmdb's `Get` takes an `RWMutex.RLock`, walks
+a skip list (several `bytes.Compare` calls per level), and — even for
+genuinely in-memory data — pays real CPU cost a direct memory-mapped
+pointer read simply doesn't have. This isn't a bug; it's the actual,
+structural cost of choosing a design optimized for write throughput over
+one optimized for read latency.
 
 **SQLite wins every write-heavy shape, including the ones LSM-tree
 theory says should favor lsmdb.** At this single-threaded, small-batch
@@ -503,18 +571,20 @@ scale," not pretended away here.
 
 **The range-scan story is really two results, and the gap between them
 is the interesting part.** lsmdb's range scan was originally ~300x
-slower than BoltDB's — far too large a gap to be normal LSM overhead.
-Investigating it surfaced a real bug: `DB.Scan` was decompressing every
-chunk of every SSTable regardless of the requested range, because it
-called `Reader.All()` instead of using the existing sparse index to skip
-irrelevant chunks. Adding `Reader.RangeScan` (which uses
-`findChunk`/binary search on the index, the exact mechanism `Get` already
-used) fixed this — **a 55x improvement**, from 19.7ms down to 367µs per
-scan on the identical benchmark. The corrected gap against BoltDB (368µs
-vs. 26µs) is now explainable by the same mmap-vs-skip-list reasoning as
-the point-read results, not by an algorithmic bug. This sequence — write
-a benchmark, get a suspicious number, investigate instead of reporting
-it, find and fix a real inefficiency, re-measure — is the actual value a
+slower than BoltDB's on the Linux sandbox — far too large a gap to be
+normal LSM overhead. Investigating it surfaced a real bug: `DB.Scan` was
+decompressing every chunk of every SSTable regardless of the requested
+range, because it called `Reader.All()` instead of using the existing
+sparse index to skip irrelevant chunks. Adding `Reader.RangeScan` (which
+uses `findChunk`/binary search on the index, the exact mechanism `Get`
+already used) fixed this — **a 55x improvement**, from 19.7ms down to
+367µs per scan on the identical benchmark. The corrected gap against
+BoltDB is now explainable by the same mmap-vs-skip-list reasoning as the
+point-read results on both platforms (lsmdb vs. BoltDB: 368µs vs. 26µs
+on Linux, 172µs vs. 16µs on the M5), not by an algorithmic bug. This
+sequence — write a benchmark, get a suspicious number, investigate
+instead of reporting it, find and fix a real inefficiency, re-measure on
+a second machine to confirm the fix generalizes — is the actual value a
 benchmark suite provides beyond bragging rights.
 
 **Where lsmdb's design should matter more than it does here:** every one
