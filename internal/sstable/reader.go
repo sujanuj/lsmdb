@@ -227,8 +227,9 @@ func (r *Reader) readChunk(chunkIdx int) ([]Entry, error) {
 
 // All reads and decompresses every chunk in order, returning the full
 // sorted entry list (including tombstones). This is the SSTable side of
-// what Phase 4's compaction and range-scan logic will need: a complete,
-// in-order stream of one file's contents to merge against others.
+// what compaction needs: a complete, in-order stream of one file's
+// contents to merge against others — compaction genuinely does need
+// every entry, since it's rewriting the whole file.
 func (r *Reader) All() ([]Entry, error) {
 	var all []Entry
 	for i := range r.index {
@@ -239,6 +240,66 @@ func (r *Reader) All() ([]Entry, error) {
 		all = append(all, entries...)
 	}
 	return all, nil
+}
+
+// RangeScan returns every entry (including tombstones — same convention
+// as All, callers filter those) whose key falls in [start, end], using
+// the sparse index to decompress only the chunks that could possibly
+// contain a matching key, rather than the whole file.
+//
+// This exists because db.DB.Scan originally called All() on every
+// SSTable regardless of the requested range — correct, but it meant a
+// scan over a 100-key window in a database with 20,000 keys still
+// decompressed the ENTIRE dataset on every call. A benchmark comparing
+// lsmdb's range scan against BoltDB's cursor surfaced this directly (a
+// roughly 300x gap that was far too large to be normal LSM overhead),
+// which is exactly the kind of problem a real benchmark suite is
+// supposed to catch — see the benchmark/ package's README notes for the
+// full before/after numbers.
+//
+// nil for start means "from the beginning of the file"; nil for end
+// means "to the end of the file" — same convention db.DB.Scan uses.
+func (r *Reader) RangeScan(start, end []byte) ([]Entry, error) {
+	startChunk := 0
+	if start != nil {
+		if idx := r.findChunk(start); idx >= 0 {
+			startChunk = idx
+		}
+		// If findChunk returns -1, start is before every chunk's first
+		// key, meaning the range could still start at chunk 0 — leaving
+		// startChunk at its zero value (0) is already correct for that
+		// case, so no special handling needed here.
+	}
+
+	var out []Entry
+	for i := startChunk; i < len(r.index); i++ {
+		// Once a chunk's firstKey is already past the end of the range,
+		// every later chunk (sorted by construction) is too — safe to
+		// stop scanning the index entirely, not just skip this chunk.
+		if end != nil && i > startChunk && bytes.Compare(r.index[i].firstKey, end) > 0 {
+			break
+		}
+
+		entries, err := r.readChunk(i)
+		if err != nil {
+			return nil, fmt.Errorf("sstable: range scan reading chunk %d: %w", i, err)
+		}
+		for _, e := range entries {
+			if start != nil && bytes.Compare(e.Key, start) < 0 {
+				continue
+			}
+			if end != nil && bytes.Compare(e.Key, end) > 0 {
+				// Entries within a chunk are sorted too, so once we're
+				// past end there's nothing more to find in this chunk
+				// either — but other chunks might still need checking
+				// against the outer loop's chunk-level boundary above,
+				// so this only breaks the inner per-entry loop.
+				break
+			}
+			out = append(out, e)
+		}
+	}
+	return out, nil
 }
 
 func gzipDecompress(data []byte) ([]byte, error) {
