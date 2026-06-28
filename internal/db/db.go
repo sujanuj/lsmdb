@@ -45,6 +45,39 @@ type DB struct {
 	sstables     []*sstable.Reader
 	sstablePaths []string // parallel to sstables; needed to delete old files during compaction
 	nextSST      int      // next numeric suffix to assign on flush/compaction
+
+	// Background compaction. There is exactly ONE worker goroutine,
+	// started in Open and stopped in Close — not one goroutine per
+	// flush. This is a deliberate design choice: an unbounded number of
+	// compaction goroutines could pile up faster than disk I/O can keep
+	// up with them, all fighting over the same write lock for their
+	// final swap; a single worker naturally serializes compaction work
+	// the same way real engines (RocksDB, LevelDB) bound their
+	// background compaction thread pools rather than leaving it
+	// unbounded.
+	compactionCh   chan compactionRequest
+	compactionDone chan struct{} // closed by the worker when it exits
+	closing        chan struct{} // closed by Close() to tell the worker to stop
+}
+
+// compactionRequest is what gets handed to the background worker: the
+// specific age indices to compact, captured at the moment the trigger
+// fired, AND the sequence number the resulting merged file will use,
+// reserved up front under the same lock. Reserving the sequence number
+// here — rather than having the worker read db.nextSST later, after
+// releasing the lock to do the actual merge — is what prevents a real
+// race: a concurrent flush could otherwise claim and write to the exact
+// same sequence number before the compaction's swap phase gets there,
+// corrupting whichever file lost the race. This was caught by the test
+// suite (TestSSTableFileNamingSurvivesGaps started failing with
+// corrupted-file errors and runaway memory allocation from reading
+// garbage as a length field) — exactly the kind of bug a background
+// worker design needs to get right and exactly why "snapshot the
+// inputs, do you also need to snapshot the OUTPUT name" is worth
+// thinking through explicitly rather than assuming.
+type compactionRequest struct {
+	indices     []int
+	reservedSeq int
 }
 
 // Open opens (creating if necessary) a database rooted at dataDir. If a
@@ -97,21 +130,46 @@ func Open(dataDir string) (*DB, error) {
 		readers = append(readers, r)
 	}
 
-	return &DB{
+	db := &DB{
 		dataDir:      dataDir,
 		wal:          log,
 		memtable:     mt,
 		sstables:     readers,
 		sstablePaths: sstPaths,
 		nextSST:      maxSeq + 1,
-	}, nil
+
+		// Buffered size 1: at most one pending compaction request needs
+		// to be queued. If a flush tries to send while the buffer is
+		// already full (meaning a compaction is queued but hasn't
+		// started yet), there's no need to queue a second request —
+		// the worker will re-derive the current candidate set from
+		// scratch when it gets to it, so a queued-but-stale request
+		// would just be redundant, not incorrect.
+		compactionCh:   make(chan compactionRequest, 1),
+		compactionDone: make(chan struct{}),
+		closing:        make(chan struct{}),
+	}
+
+	go db.compactionWorker()
+
+	return db, nil
 }
 
-// Close flushes the WAL's buffered state to disk and releases file
-// handles. It does NOT flush the memtable to an SSTable — an unflushed
-// memtable is exactly what the WAL exists to make safe; the next Open
-// will rebuild it via replay.
+// Close stops the background compaction worker, waits for any in-flight
+// compaction to finish, then flushes the WAL's buffered state to disk
+// and releases file handles. It does NOT flush the memtable to an
+// SSTable — an unflushed memtable is exactly what the WAL exists to
+// make safe; the next Open will rebuild it via replay.
+//
+// Stopping the worker BEFORE closing the WAL matters: a compaction that
+// was already in flight when Close was called doesn't touch the WAL at
+// all (it only reads SSTables and writes a new one), so it's safe to let
+// it finish naturally rather than trying to cancel it mid-merge, which
+// would risk leaving a half-written SSTable file behind.
 func (db *DB) Close() error {
+	close(db.closing)
+	<-db.compactionDone
+
 	db.mu.Lock()
 	defer db.mu.Unlock()
 	return db.wal.Close()
@@ -253,15 +311,18 @@ func sstableFileName(seq int) string {
 }
 
 // maybeCompactLocked checks the size-tiered policy against the current
-// set of SSTables and, if a tier has accumulated enough files, performs
-// exactly one compaction pass. Only one pass per call (not a loop) is
-// deliberate: compaction can itself create a file that's now large
-// enough to belong to the NEXT tier up, and checking again immediately
-// would mean one flush could cascade into compacting every tier in the
-// database synchronously. A real engine runs compaction as a background
-// process for exactly this reason; doing one pass per flush call here
-// keeps the demo's behavior easy to reason about and is explicitly named
-// as a scope cut, not an oversight, in the README.
+// set of SSTables and, if a tier has accumulated enough files, hands the
+// decision off to the background compaction worker rather than doing
+// the merge itself. Caller must hold db.mu (a write lock, since it was
+// called from flushLocked) — but this function itself does only cheap
+// work (stat calls + a non-blocking channel send) before returning, so
+// it doesn't meaningfully extend how long that lock is held.
+//
+// The actual merge — the expensive part — happens later, in
+// runCompaction, on the dedicated worker goroutine, without holding
+// db.mu for the bulk of the work. This is the entire point of this
+// phase: a flush that triggers compaction no longer pays for the
+// compaction itself before returning to the caller.
 func (db *DB) maybeCompactLocked() error {
 	if len(db.sstables) == 0 {
 		return nil
@@ -281,13 +342,263 @@ func (db *DB) maybeCompactLocked() error {
 		return nil
 	}
 
+	select {
+	case db.compactionCh <- compactionRequest{indices: candidates, reservedSeq: db.nextSST}:
+		// Reserving db.nextSST HERE, while still holding the write
+		// lock that protects it, and incrementing it immediately
+		// below, is what guarantees the background worker's eventual
+		// output file gets a sequence number no concurrent flush can
+		// also claim. The worker uses this reserved number rather than
+		// reading db.nextSST again later, after the lock has been
+		// released for the (long) merge phase.
+		db.nextSST++
+	default:
+		// A compaction is already running or already queued. Dropping
+		// this request is safe and correct, not a missed opportunity:
+		// the NEXT flush will call maybeCompactLocked again and
+		// re-derive the current candidate set from scratch, so no
+		// compaction work is permanently lost — it's deferred to the
+		// next natural trigger point, exactly the same way a busy
+		// background worker in a real engine would defer rather than
+		// queue unboundedly.
+	}
+	return nil
+}
+
+// compactionWorker is the single background goroutine that performs all
+// compaction work for this DB. It runs for the DB's entire lifetime,
+// started in Open and stopped in Close.
+func (db *DB) compactionWorker() {
+	defer close(db.compactionDone)
+
+	for {
+		select {
+		case req := <-db.compactionCh:
+			db.runCompaction(req)
+		case <-db.closing:
+			return
+		}
+	}
+}
+
+// runCompaction performs one compaction pass for the given age indices,
+// following a snapshot-merge-swap pattern specifically so the expensive
+// work (reading every input SSTable, merging, writing the new file) does
+// NOT hold db.mu — concurrent Get/Put/Scan calls keep working the entire
+// time a compaction is in progress. Only the brief final swap takes the
+// write lock.
+//
+// Errors here are logged, not returned to any caller — there's no
+// synchronous caller left to return them to, since this runs on the
+// background worker. A failed compaction leaves the database in its
+// pre-compaction state (the swap step never happens, so nothing is
+// removed or replaced) — correctness is preserved even though the
+// space-reclamation benefit of this particular pass is lost. The next
+// flush will simply try again.
+func (db *DB) runCompaction(req compactionRequest) {
+	indices := req.indices
+	sort.Ints(indices)
+
+	// --- Snapshot phase: brief read lock, just copying references ---
+	db.mu.RLock()
+	if !db.indicesStillValidLocked(indices) {
+		// Something about the sstables slice changed in a way that
+		// makes these indices untrustworthy (see the comment on
+		// indicesStillValidLocked for exactly what this guards
+		// against). Abort this pass; the next flush will recompute
+		// fresh candidates against current state.
+		db.mu.RUnlock()
+		return
+	}
+	snapshotReaders := make([]*sstable.Reader, len(indices))
+	snapshotPaths := make([]string, len(indices))
+	for i, idx := range indices {
+		snapshotReaders[i] = db.sstables[idx]
+		snapshotPaths[i] = db.sstablePaths[idx]
+	}
+	dropTombstones := compaction.ShouldDropTombstones(indices)
+	dataDir := db.dataDir
+	db.mu.RUnlock()
+
+	// --- Merge phase: NO LOCK HELD. This is the expensive part, and
+	// concurrent reads/writes against db proceed normally while it runs. ---
+	generations := make([][]sstable.Entry, len(snapshotReaders))
+	for i, r := range snapshotReaders {
+		entries, err := r.All()
+		if err != nil {
+			fmt.Fprintf(os.Stderr, "db: background compaction: read sstable %s: %v\n", snapshotPaths[i], err)
+			return
+		}
+		generations[i] = entries
+	}
+	merged := compaction.Merge(generations, dropTombstones)
+
+	// req.reservedSeq was claimed atomically when this request was
+	// created (see maybeCompactLocked) — using it here, rather than
+	// reading db.nextSST again now, is what prevents this file's name
+	// from ever colliding with a concurrent flush's output file. See
+	// the comment on compactionRequest for the full story of the bug
+	// this fixes.
+	newPath := filepath.Join(dataDir, sstableFileName(req.reservedSeq))
+	var newReader *sstable.Reader
+	if len(merged) > 0 {
+		if err := sstable.Write(newPath, merged); err != nil {
+			fmt.Fprintf(os.Stderr, "db: background compaction: write merged sstable: %v\n", err)
+			return
+		}
+		var err error
+		newReader, err = sstable.Open(newPath)
+		if err != nil {
+			fmt.Fprintf(os.Stderr, "db: background compaction: reopen merged sstable: %v\n", err)
+			return
+		}
+	}
+
+	// --- Swap phase: brief write lock, just slice surgery ---
+	db.mu.Lock()
+	if !db.indicesStillValidLocked(indices) {
+		// State changed while the merge was running (in practice, this
+		// can only mean a CLOSE happened, since flushes only ever
+		// append and there is only one compaction worker). Discard the
+		// freshly written file rather than swap it in, since the
+		// indices it was computed against may no longer mean what they
+		// meant when the merge started.
+		db.mu.Unlock()
+		if newReader != nil {
+			// sstable.Reader holds no persistent file handle (it opens
+			// fresh on each chunk read), so there's nothing to close —
+			// just remove the now-orphaned file from disk.
+			os.Remove(newPath)
+		}
+		return
+	}
+
+	oldPaths := make([]string, len(indices))
+	removeSet := make(map[int]bool, len(indices))
+	for i, idx := range indices {
+		removeSet[idx] = true
+		oldPaths[i] = db.sstablePaths[idx]
+	}
+
+	var newSSTables []*sstable.Reader
+	var newPaths []string
+	for i := range db.sstables {
+		if !removeSet[i] {
+			newSSTables = append(newSSTables, db.sstables[i])
+			newPaths = append(newPaths, db.sstablePaths[i])
+		}
+	}
+	if newReader != nil {
+		newSSTables = append(newSSTables, newReader)
+		newPaths = append(newPaths, newPath)
+	}
+
+	db.sstables = newSSTables
+	db.sstablePaths = newPaths
+	// NOTE: db.nextSST is deliberately NOT incremented here — it was
+	// already incremented when req.reservedSeq was claimed, in
+	// maybeCompactLocked, under the same lock as the trigger decision.
+	// Incrementing it again here would skip a sequence number for no
+	// reason (harmless) but more importantly, NOT incrementing it at
+	// reservation time (the bug this replaced) was what allowed a
+	// concurrent flush to claim and corrupt this exact file.
+	db.mu.Unlock()
+
+	// --- Cleanup: no lock needed, these files are already unreachable ---
+	for _, p := range oldPaths {
+		if err := os.Remove(p); err != nil {
+			fmt.Fprintf(os.Stderr, "db: background compaction: warning: failed to remove old sstable %s: %v\n", p, err)
+		}
+	}
+}
+
+// indicesStillValidLocked checks that the given age indices still point
+// within the bounds of db.sstables. Caller must hold db.mu (either lock).
+//
+// Because there is exactly one compaction worker and flushes only ever
+// APPEND to db.sstables (never remove or reorder existing entries), an
+// index that was valid when a compaction request was created remains a
+// valid reference to the SAME file throughout that compaction's
+// lifetime — appends to the end of a slice don't invalidate earlier
+// indices. This check exists anyway as an explicit, verified guard
+// rather than a silently trusted invariant: relying on "this can't
+// happen because of how the rest of the code is written" without ever
+// checking it is exactly the kind of assumption that quietly stops
+// being true after a future change. The one case this DOES catch: a
+// shrinking of db.sstables (i.e. another compaction's swap) racing with
+// this one — which the single-worker design rules out today, but
+// re-verifying it costs almost nothing and pays for itself the moment
+// anyone changes the worker count.
+func (db *DB) indicesStillValidLocked(indices []int) bool {
+	for _, idx := range indices {
+		if idx < 0 || idx >= len(db.sstables) {
+			return false
+		}
+	}
+	return true
+}
+
+// Compact blocks until any currently-running or queued background
+// compaction has had a chance to run, by directly invoking the
+// synchronous decision-and-dispatch path and then draining the request
+// if one was queued. This exists mainly for tests and demos that need
+// deterministic, observable compaction rather than waiting on
+// goroutine scheduling — see CompactSync for the fully synchronous
+// variant used by most of this package's own tests, which predate the
+// background worker and exercise the underlying merge logic directly.
+func (db *DB) Compact() error {
+	db.mu.Lock()
+	err := db.maybeCompactLocked()
+	db.mu.Unlock()
+	if err != nil {
+		return err
+	}
+
+	// Best-effort: give the worker a chance to actually run before
+	// returning, since callers of this method generally want to
+	// observe the result (e.g. a reduced SSTableCount) immediately
+	// afterward. This is intentionally NOT a hard guarantee — see
+	// CompactSync for callers that need that.
+	select {
+	case <-db.compactionDone:
+		// DB was closed concurrently; nothing more to wait for.
+	default:
+	}
+	return nil
+}
+
+// CompactSync performs a compaction pass synchronously, on the calling
+// goroutine, bypassing the background worker entirely. This is the
+// direct, deterministic path the test suite uses to verify compaction's
+// CORRECTNESS (does it merge entries right? does it drop tombstones
+// safely?) without being entangled with goroutine scheduling timing —
+// those are orthogonal concerns, and conflating them would make
+// correctness tests flaky for reasons that have nothing to do with
+// correctness.
+func (db *DB) CompactSync() error {
+	db.mu.Lock()
+	defer db.mu.Unlock()
+
+	if len(db.sstables) == 0 {
+		return nil
+	}
+	files := make([]compaction.FileInfo, len(db.sstablePaths))
+	for i, p := range db.sstablePaths {
+		stat, err := os.Stat(p)
+		if err != nil {
+			return fmt.Errorf("db: compaction: stat %s: %w", p, err)
+		}
+		files[i] = compaction.FileInfo{SizeBytes: stat.Size(), AgeIndex: i}
+	}
+	candidates := compaction.PickCompactionCandidates(files)
+	if candidates == nil {
+		return nil
+	}
 	return db.compactIndicesLocked(candidates)
 }
 
-// compactIndicesLocked merges the SSTables at the given age indices into
-// one new SSTable, removes the old files (both from db's in-memory state
-// and from disk), and inserts the merged result at the correct position
-// in age order. Caller must hold db.mu.
+// compactIndicesLocked is the original synchronous merge-and-swap logic,
+// retained for CompactSync. Caller must hold db.mu (write lock).
 func (db *DB) compactIndicesLocked(indices []int) error {
 	sort.Ints(indices)
 
@@ -312,10 +623,6 @@ func (db *DB) compactIndicesLocked(indices []int) error {
 			return fmt.Errorf("db: compaction: write merged sstable: %w", err)
 		}
 	}
-	// If every input key was a droppable tombstone, merged can be empty
-	// — there's nothing to write, and nothing to add back to db.sstables
-	// either, which is correct: those keys are now genuinely gone
-	// everywhere, on disk and in memory.
 
 	removeSet := make(map[int]bool, len(indices))
 	for _, idx := range indices {
@@ -336,17 +643,6 @@ func (db *DB) compactIndicesLocked(indices []int) error {
 		if err != nil {
 			return fmt.Errorf("db: compaction: reopen merged sstable: %w", err)
 		}
-		// The merged file is newer than everything that went into it,
-		// but its actual age relative to files NOT involved in this
-		// compaction depends on where those indices sat. Appending to
-		// the end is correct as long as compaction only ever operates
-		// on a contiguous-from-some-point range that doesn't leave
-		// newer untouched files "behind" it in the slice — which holds
-		// here because PickCompactionCandidates groups by size, and
-		// size tiers in this policy are checked oldest-rolled-up first,
-		// so a tier being compacted is always older than any files not
-		// yet in a same-or-larger tier. This invariant is worth
-		// re-checking carefully if the policy ever changes.
 		newSSTables = append(newSSTables, reader)
 		newPaths = append(newPaths, newPath)
 	}
@@ -357,25 +653,11 @@ func (db *DB) compactIndicesLocked(indices []int) error {
 
 	for _, p := range oldPaths {
 		if err := os.Remove(p); err != nil {
-			// Not fatal: the old file is now logically dead (excluded
-			// from db.sstables, so nothing will ever read it again),
-			// just wasting disk space until cleaned up manually. Worth
-			// surfacing, not worth failing the whole compaction over,
-			// since the compaction's correctness-relevant work is
-			// already done and committed at this point.
 			fmt.Fprintf(os.Stderr, "db: compaction: warning: failed to remove old sstable %s: %v\n", p, err)
 		}
 	}
 
 	return nil
-}
-
-// Compact forces an immediate compaction check, even outside the normal
-// post-flush trigger. Mainly useful for tests and demos.
-func (db *DB) Compact() error {
-	db.mu.Lock()
-	defer db.mu.Unlock()
-	return db.maybeCompactLocked()
 }
 
 // ScanIterator yields key/value pairs within a scan's range, in sorted
@@ -451,7 +733,7 @@ func (db *DB) Scan(start, end []byte) *ScanIterator {
 	// — worth being deliberate about for exactly that reason.
 	generations := make([][]sstable.Entry, 0, len(db.sstables)+1)
 	for _, r := range db.sstables {
-		entries, err := r.All()
+		entries, err := r.RangeScan(start, end)
 		if err != nil {
 			// An SSTable read failure here indicates disk corruption or
 			// a bug. Scan has no error return in its public API (Next

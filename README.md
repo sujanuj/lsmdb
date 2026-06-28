@@ -103,7 +103,7 @@ layer work, rather than depend on one.
       `[start, end]` (inclusive both ends), built from the memtable plus
       every SSTable as one merge
 
-**Phase 7 (current): Benchmarks vs. SQLite and BoltDB**
+**Phase 7: Benchmarks vs. SQLite and BoltDB — done**
 
 - [x] `benchmark/`: head-to-head Go `testing.B` benchmarks against real,
       external engines — `github.com/mattn/go-sqlite3` (SQLite, configured
@@ -133,9 +133,44 @@ layer work, rather than depend on one.
       correctness tests added for the fix before trusting the new numbers
 - [x] Full results table and honest analysis below — including the cases
       where lsmdb loses, and why
+- [x] Independently re-run end-to-end on a second machine (Apple M5,
+      arm64/APFS) — both result tables, and an honest analysis of where
+      they agree and where they don't, are in the benchmarks section
 
-**What's next:** This completes the planned phases. See "Ideas for
-further work" at the end for what a Phase 8+ could look like.
+**Phase 8 (current): Async/background compaction**
+
+- [x] Compaction moved off the calling `Put`/`Delete`/`Flush` goroutine
+      onto a single dedicated background worker, using a
+      snapshot-merge-swap pattern so the expensive part (reading every
+      input file, merging, writing the new SSTable) holds no lock at all
+- [x] **A real race condition found and fixed:** the first version let the
+      background worker re-read the shared sequence counter after
+      releasing the lock for the merge, allowing a concurrent flush to
+      claim and corrupt the same output file. Caught immediately by the
+      existing test suite (a `gzip: invalid header` error, then a 42GB
+      allocation attempt from a corrupted length field). Fixed by
+      reserving the sequence number atomically, under the same lock as
+      the trigger decision, before the merge ever starts
+- [x] **A real deadlock found and fixed — in the test, not the code under
+      test:** a concurrency stress test's first version used one shared
+      `WaitGroup` for both writer and reader goroutines with a circular
+      stop-signal dependency. Diagnosed precisely via `go test -timeout`'s
+      full goroutine dump, not guessed at. Fixed with separate WaitGroups
+- [x] `CompactSync()` kept as an explicit, separate entry point so
+      correctness tests (does the merge produce the right output?) don't
+      depend on background-goroutine scheduling timing
+- [x] A new test exercising the real async trigger end-to-end
+      (`TestBackgroundCompactionEventuallyRuns`) and a concurrency stress
+      test running real concurrent readers and writers against a
+      continuously-compacting database, verified clean under `-race`
+      across multiple repeated runs
+- [x] Re-measured: `BenchmarkSequentialWrite` improved from 577µs/op to
+      500.7µs/op (~13%) — a real, modest, honestly-reported improvement,
+      not a dramatic one, since `fsync` cost still dominates write
+      latency at this benchmark's scale more than compaction blocking did
+
+**What's next:** Phase 8 completes the currently-planned work. See "Ideas
+for further work" at the end for what a Phase 9+ could look like.
 
 ## Why a skip list, not a balanced tree, for the memtable
 
@@ -619,26 +654,137 @@ since BoltDB and SQLite setup phases (writing many keys with per-write
 fsync) can otherwise dominate wall-clock time at very high iteration
 counts.
 
+## Phase 8: Async/background compaction
+
+Every compaction pass through Phase 7 ran synchronously, inside whichever
+`Put`/`Delete`/`Flush` call happened to trigger it — meaning a write that
+crossed the flush threshold and also triggered a compaction had to wait
+for that compaction's full merge-and-rewrite before returning. This phase
+moves compaction onto a single dedicated background goroutine, so the
+triggering write returns as soon as the (cheap) decision to compact is
+made, not after the (expensive) merge finishes.
+
+### The design: snapshot, merge, swap
+
+```
+maybeCompactLocked (still under db's write lock, called from flushLocked):
+  -> decide IF a tier should compact (cheap: a few os.Stat calls)
+  -> reserve the new file's sequence number, increment nextSST
+  -> non-blocking send to a buffered-size-1 channel; if full, skip
+     (the next flush will re-derive fresh candidates anyway)
+
+compactionWorker (one goroutine, for the DB's whole lifetime):
+  loop: select on the request channel or a shutdown signal
+
+runCompaction(request):
+  1. RLock  -> snapshot which *sstable.Reader/paths are being compacted
+  2. RUnlock
+  3. NO LOCK HELD -> read every input file, merge, write the new SSTable
+     (this is the expensive part, and Get/Put/Scan keep working the
+     entire time it runs)
+  4. Lock   -> swap the old readers/paths for the new merged one
+  5. Unlock
+  6. delete the old files (no lock needed, they're already unreachable)
+```
+
+Only steps 1-2 and 4-5 hold `db.mu`, and both are just slice bookkeeping —
+no disk I/O happens while the lock is held. The actual merge (step 3) is
+where all the real work and all the real time goes, and it happens with
+zero lock contention against concurrent readers or writers.
+
+### Two real bugs, found and fixed by writing this
+
+**A sequence-number race that corrupted a file.** The first version had
+the background worker re-read `db.nextSST` for its output filename
+*after* releasing the lock to do the merge. A concurrent flush could
+claim and start writing to that exact same sequence number in the
+meantime — two goroutines writing the same file path simultaneously.
+This wasn't theoretical: running the existing test suite against the new
+async code immediately produced a `gzip: invalid header` error and, on a
+later run, a 42GB allocation attempt from `sstable.Open` trying to
+interpret corrupted footer bytes as a buffer length. The fix: reserve the
+sequence number (and increment `nextSST`) at the moment the compaction
+request is *created*, under the same write lock as the trigger decision
+— not later, inside the worker, after the lock has been released. The
+previously-crashing test was then run 10 times in a row plus repeatedly
+under `-race`, with zero failures, before trusting the fix.
+
+**A genuine deadlock in the test written to prove the fix.** The first
+version of the concurrent stress test (writers + readers running against
+a continuously-compacting database) used one `sync.WaitGroup` for both
+writer and reader goroutines, then tried to signal readers to stop only
+after that WaitGroup finished. Readers, however, only ever return when
+told to stop — so the wait could never complete while they were part of
+it: a circular wait, entirely in the test's own synchronization logic,
+not in `db.go`. This hung for the full test timeout on the first run.
+Diagnosed precisely (not guessed at) via `go test -timeout`, which dumps
+every goroutine's stack on timeout — showing four reader goroutines
+peacefully sleeping and zero writer goroutines left, with the wait
+permanently blocked in `semacquire`. The fix: separate WaitGroups for
+writers and readers, waited on in sequence. This class of bug — a test
+deadlocking due to its own goroutine coordination, distinct from the
+code under test — is worth being able to recognize and diagnose calmly
+rather than panicking at "my code must be broken," since concurrent test
+harnesses have exactly as much surface area for bugs as the thing they're
+testing.
+
+### Two compaction entry points, on purpose
+
+- **`CompactSync()`** — runs a compaction pass synchronously, on the
+  calling goroutine, bypassing the worker entirely. This is what the
+  correctness-focused tests (does the merge produce the right output?
+  are tombstones dropped safely?) use, because correctness and goroutine
+  scheduling timing are orthogonal concerns, and conflating them would
+  make correctness tests flaky for reasons that have nothing to do with
+  correctness.
+- **The automatic trigger** (via `Put`/`Delete`/`Flush` crossing the
+  size-tiered threshold) — dispatches to the background worker, and is
+  what `TestBackgroundCompactionEventuallyRuns` and
+  `TestConcurrentReadsWritesDuringBackgroundCompaction` exercise: the
+  first polls for the async result with a timeout, the second runs real
+  concurrent readers and writers against a continuously-compacting
+  database under `-race` and checks every key's final value matches an
+  independently-tracked expectation.
+
+### Measured effect
+
+Re-running `BenchmarkSequentialWrite` after this change: **500.7µs/op**,
+down from **577µs/op** before async compaction (Phase 7's Linux sandbox
+baseline) — roughly 13% faster. This is a real but modest improvement,
+not a dramatic one, and that's itself worth reporting honestly: at this
+benchmark's scale, `fsync`-per-write cost still dominates total write
+latency far more than whether compaction blocks the caller does (see the
+cross-platform benchmark analysis above for the full fsync story). The
+improvement is exactly what theory predicts — writes no longer
+occasionally pay for a full merge-and-rewrite before returning — it's
+just one of several costs in the write path, not the largest one at this
+scale.
+
 ## Ideas for further work
 
-This project deliberately stopped at 7 phases — long enough to cover the
+This project deliberately stopped at 8 phases — long enough to cover the
 core mechanisms of a real LSM engine end to end, short enough to keep
 every phase genuinely well-tested rather than rushing breadth over
 depth. If continuing:
 
-- **Async/background compaction**, so writes never block on a merge
 - **Leveled compaction** as an alternative strategy to size-tiered, with
   a benchmark comparing write/space amplification between the two
 - **Configurable WAL sync batching** (`SyncManual` + a timer), and
-  re-running the write benchmarks above to see the random-vs-sequential
-  write gap LSM theory predicts actually appear
-- **Concurrent benchmark variants** (multiple goroutines writing/reading
-  simultaneously), since single-threaded benchmarks understate where
-  lsmdb's lock-per-operation design either helps or hurts relative to
-  BoltDB's single-writer/many-readers model
+  re-running the write benchmarks above to see how much of the remaining
+  write cost is fsync vs. everything else
+- **Concurrent benchmark variants** in the `benchmark/` suite itself
+  (multiple goroutines writing/reading simultaneously against all three
+  engines), since the single-threaded benchmarks there understate where
+  lsmdb's now-concurrent-friendly compaction either helps or hurts
+  relative to BoltDB's single-writer/many-readers model
 - **A chunk cache** in `sstable.Reader`, to avoid re-decompressing the
   same hot chunk on every repeated read — directly informed by how slow
   the uncached cold-read benchmark above turned out to be
+- **A bounded worker pool** instead of a single compaction goroutine, if
+  a workload ever produced enough simultaneously-compactable tiers that
+  one worker became a throughput bottleneck — the current single-worker
+  design was a deliberate starting point (simpler lifecycle, easier to
+  reason about), not a permanent ceiling
 
 ## Why a WAL first
 
@@ -704,8 +850,9 @@ truncated tail.
 ## Running tests
 
 ```bash
-go test ./internal/...          # everything (94 tests as of Phase 7)
+go test ./internal/...          # everything (96 tests as of Phase 8)
 go test ./internal/... -race    # with the race detector
+go test ./internal/db/... -run TestConcurrentReadsWritesDuringBackgroundCompaction -race -v   # the async compaction stress test specifically
 go test ./benchmark/... -run TestEngineAdaptersCorrectness -v   # sanity-check engine adapters
 go test ./benchmark/... -bench=. -benchtime=1000x -run=^$ -v    # the actual benchmark suite
 ```
@@ -722,7 +869,8 @@ lsmdb/
 │   ├── bloom/             <- from-scratch bloom filter (Phase 4)
 │   ├── iterator/          <- shared lazy k-way merge iterator (Phase 6)
 │   ├── compaction/        <- size-tiered policy + Merge (Phase 5)
-│   └── db/                <- Get/Put/Delete/Scan + compaction trigger
+│   └── db/                <- Get/Put/Delete/Scan + background compaction
+│                              worker (Phase 5, async since Phase 8)
 ├── benchmark/             <- head-to-head vs. SQLite and BoltDB (Phase 7)
 └── cmd/
     └── lsmdb-cli/       <- demo/debug CLI
